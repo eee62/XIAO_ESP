@@ -9,9 +9,15 @@
 include/secrets.h
 
 # Written by pioarduino's custom_sdkconfig build from platformio.ini: the IDF
-# components it downloads, and the sdkconfig files it generates.
+# components it downloads, the sdkconfig files it generates, and the stub
+# project it compiles the IDF libs through.
 managed_components/
 /sdkconfig*
+.dummy/
+
+# Local to one machine: Claude Code settings and the VS Code workspace file.
+.claude/
+*.code-workspace
 
 # macOS Finder metadata.
 .DS_Store
