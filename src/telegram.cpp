@@ -18,6 +18,10 @@
 // response body into RAM.
 #define TG_ERR_CAPTURE 192
 
+// Response header lines skipped to reach that body. Telegram sends about ten;
+// this only bounds a reply whose headers never end.
+#define TG_MAX_HEADER_LINES 40
+
 bool telegram_configured()
 {
 	// Both are string literals from config.h/secrets.h, so this folds to a
@@ -128,14 +132,42 @@ static bool tg_post(const char *method, const char *content_type,
 	if (!ok) {
 		// Telegram puts the reason in the JSON body, not the status line, and
 		// it is the difference between a wrong chat id and a revoked token.
-		String tail;
-		tail.reserve(TG_ERR_CAPTURE);
-		while (client.available() && tail.length() < TG_ERR_CAPTURE) {
-			tail += (char)client.read();
+		// The headers come first and on their own run well past
+		// TG_ERR_CAPTURE, so read through to the blank line that ends them.
+		// Every read here is a timed one: available() reads 0 between TLS
+		// records, so it cannot tell a reply still arriving from one that has
+		// ended.
+		long content_len = -1;
+		for (int i = 0; i < TG_MAX_HEADER_LINES; i++) {
+			String line = client.readStringUntil('\n');
+			line.trim();
+			if (line.length() == 0) {
+				break;   // end of the headers, or nothing more arrived
+			}
+			const int colon = line.indexOf(':');
+			if (colon > 0 &&
+			    line.substring(0, colon).equalsIgnoreCase("Content-Length")) {
+				content_len = line.substring(colon + 1).toInt();
+			}
 		}
-		tail.replace('\r', ' ');
-		tail.replace('\n', ' ');
-		log_e("telegram: %s -> HTTP %d %s", method, code, tail.c_str());
+
+		size_t want = TG_ERR_CAPTURE;
+		if (content_len >= 0 && (size_t)content_len < want) {
+			want = (size_t)content_len;
+		}
+		// Stream::readBytes() by name, which waits out each gap with a
+		// timeout. The override WiFiClientSecure would otherwise inherit,
+		// NetworkClient::readBytes(), stops at the first -1 from read(), and
+		// the TLS read() returns -1 whenever nothing is decrypted yet.
+		char reply[TG_ERR_CAPTURE + 1];
+		const size_t got = client.Stream::readBytes(reply, want);
+		for (size_t i = 0; i < got; i++) {
+			if (reply[i] == '\r' || reply[i] == '\n') {
+				reply[i] = ' ';
+			}
+		}
+		reply[got] = '\0';
+		log_e("telegram: %s -> HTTP %d %s", method, code, reply);
 	} else {
 		log_i("telegram: %s ok (%u bytes, %lu ms)", method,
 		      (unsigned)body_len, (unsigned long)(millis() - t0));
