@@ -263,6 +263,43 @@
 #define TELEMETRY_WAKE_FLOOR_S   (10 * 60)
 
 // ---------------------------------------------------------------------------
+// Wake deadline
+// ---------------------------------------------------------------------------
+// The detection builds turn the task watchdog off (CONFIG_ESP_TASK_WDT_INIT=n
+// in platformio.ini), and the one bench-nodetect keeps only watches core 0's
+// idle task, never the loop task this firmware runs on. So nothing else ends
+// a wake that hangs in a TLS read that never returns or a library deadlock:
+// the node would stay up, radio and all, until the DW01 cut the cell off (6).
+//
+// setup() arms a one-shot esp_timer for this long once it knows the wake is
+// not deployment mode, and on expiry the node calls esp_system_abort(). Every
+// build prints and reboots on a panic, so the next boot sees ESP_RST_PANIC
+// and takes the abnormal-reset path: counted as a crash in the report (9.3),
+// then back to sleep without the radio. Deployment mode is attended and never
+// sleeps, so it is never on the clock.
+//
+// This has to sit comfortably above the longest normal wake, which is a burst
+// held open to its cap and then delivered in full:
+//
+//     600 s  BURST_MAX_DURATION   burst held open until the cap
+//   +  30 s  BURST_SETTLE         a last settle sleep, ended by a trigger
+//   +  60 s  2 x PIR_IDLE_MAX_S   PIR held high after that trigger, and again
+//                                 before deep sleep (main.cpp)
+//   +  12 s  WIFI_CONNECT_TIMEOUT_MS + WIFI_DHCP_TIMEOUT_MS
+//   + 120 s  BURST_MAX_FRAMES x TELEGRAM_TIMEOUT_MS
+//   = 822 s
+//
+// 20 minutes is ~45% over that. The margin is for what those constants do not
+// bound: camera bring-up, detection, DNS lookups, and TLS requests that run
+// past TELEGRAM_TIMEOUT_MS (the handshake has its own TELEGRAM_HANDSHAKE_S,
+// and the upload is only checked between writes). main.cpp checks the sum at
+// compile time, so retuning a term past this fails the build instead of
+// cutting long bursts short. A hang that runs the full 20 minutes with the
+// radio up costs something like 30 mAh, a few days of the 7 budget, rather
+// than the cell.
+#define WAKE_DEADLINE_S          (20 * 60)
+
+// ---------------------------------------------------------------------------
 // Deployment mode — held-BOOT-button setup/aiming interface.
 //
 // Not in PROJECT_BRIEF.md: this is an operator-facing mode for siting the node

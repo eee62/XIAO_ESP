@@ -1185,6 +1185,51 @@ static void reset_stats_note(esp_reset_reason_t r)
 }
 
 // ---------------------------------------------------------------------------
+// Wake deadline (config.h)
+// ---------------------------------------------------------------------------
+// Dispatched on the esp_timer task, which is pinned to core 0 at priority 22.
+// This firmware runs on the Arduino loop task, core 1, priority 1, so nothing
+// the loop task gets stuck in, blocked or spinning, can hold the abort off.
+// Only something on core 0 could: interrupts left disabled, which the
+// interrupt watchdog catches; a higher-priority task that never yields; or
+// another esp_timer callback that never returns, since those run one at a
+// time. ISR dispatch would get past the last, but it is not compiled into
+// these builds' sdkconfig.
+//
+// A deadline that passes during one of the light sleeps in run_burst() or
+// wait_for_pir_idle() fires as soon as the node wakes: esp_light_sleep_start()
+// winds esp_timer's counter forward by the time slept, and the S3's systimer
+// raises an alarm whose target is already behind the counter. Those sleeps
+// last BURST_SETTLE at most.
+static void wake_deadline_expired(void *)
+{
+	esp_system_abort("wake deadline");
+}
+
+// config.h works WAKE_DEADLINE_S out by hand. PIR_IDLE_MAX_S lives in this
+// file, so this is where the sum can be checked.
+static_assert(WAKE_DEADLINE_S > BURST_MAX_DURATION + BURST_SETTLE + 2 * PIR_IDLE_MAX_S +
+                                (WIFI_CONNECT_TIMEOUT_MS + WIFI_DHCP_TIMEOUT_MS) / 1000 +
+                                BURST_MAX_FRAMES * TELEGRAM_TIMEOUT_MS / 1000,
+              "WAKE_DEADLINE_S no longer covers the longest normal wake (config.h)");
+
+// Never stopped: every path after setup() arms it ends in deep sleep, which
+// takes the timer down with everything else.
+static void wake_deadline_arm()
+{
+	esp_timer_create_args_t args = {};
+	args.callback        = wake_deadline_expired;
+	args.dispatch_method = ESP_TIMER_TASK;
+	args.name            = "wake_deadline";
+
+	esp_timer_handle_t timer;
+	if (esp_timer_create(&args, &timer) != ESP_OK ||
+	    esp_timer_start_once(timer, (uint64_t)WAKE_DEADLINE_S * 1000000ULL) != ESP_OK) {
+		log_e("wake deadline not armed; a hang will keep the node up");
+	}
+}
+
+// ---------------------------------------------------------------------------
 // setup(): the whole cycle. Control reaches loop() only in deployment mode.
 // ---------------------------------------------------------------------------
 void setup()
@@ -1258,6 +1303,10 @@ void setup()
 		deploy_mode_begin();
 		return;   // setup() returns only here; loop() takes over
 	}
+
+	// Deployment mode has returned by now. Everything below ends in deep
+	// sleep and runs against the wake deadline (config.h).
+	wake_deadline_arm();
 
 	if (cause != ESP_SLEEP_WAKEUP_EXT0) {
 		// Power-on or reset, not a real trigger. Report once so a node that
