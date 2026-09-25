@@ -416,6 +416,7 @@ function render(d){
   row('Burst rule',d.burst_n+' in '+d.burst_w+'s, settle '+d.burst_settle+'s');
   row('Detection',d.model+(d.model=='disabled'?'':' @ '+d.thr));
   row('Uplink',d.sta_ssid+' → Telegram '+(d.telegram?'ready':'NOT CONFIGURED'));
+  row('Network',d.net_mode);
   row('AP cache',d.ap_cache?'ch '+d.ap_ch:'none (full scan next)');
   row('Free heap',kb(d.heap)+' (min '+kb(d.heap_min)+')');
   row('Free PSRAM',kb(d.psram_free)+' / '+kb(d.psram_size));
