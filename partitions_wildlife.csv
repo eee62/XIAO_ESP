@@ -1,0 +1,10 @@
+# Wildlife camera node — 8 MB flash, single app slot, no OTA.
+# esp-dl + detection model + Arduino + WiFi does not fit the stock
+# default_8MB.csv 3.3 MB OTA slots. Nothing in PROJECT_BRIEF.md asks for OTA.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x009000, 0x005000,
+phy_init,   data, phy,      0x00E000, 0x001000,
+factory,    app,  factory,  0x010000, 0x600000,
+storage,    data, spiffs,   0x610000, 0x1E0000,
+coredump,   data, coredump, 0x7F0000, 0x010000,
