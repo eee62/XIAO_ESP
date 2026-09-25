@@ -1207,10 +1207,17 @@ static void wake_deadline_expired(void *)
 }
 
 // config.h works WAKE_DEADLINE_S out by hand. PIR_IDLE_MAX_S lives in this
-// file, so this is where the sum can be checked.
+// file, so this is where the sum can be checked. Seconds throughout; config.h
+// derives each term.
+#define DNS_LOOKUP_MAX_S  (7 * CONFIG_LWIP_DNS_MAX_SERVERS)
+#define TG_CONNECT_MAX_S  (DNS_LOOKUP_MAX_S + TELEGRAM_TIMEOUT_MS / 1000 + \
+                           TELEGRAM_HANDSHAKE_S)
+#define TG_STALL_MAX_S    (2 * TELEGRAM_TIMEOUT_MS / 1000)
+#define TG_POST_MAX_S     (TG_CONNECT_MAX_S > TG_STALL_MAX_S ? TG_CONNECT_MAX_S : \
+                                                               TG_STALL_MAX_S)
 static_assert(WAKE_DEADLINE_S > BURST_MAX_DURATION + BURST_SETTLE + 2 * PIR_IDLE_MAX_S +
                                 (WIFI_CONNECT_TIMEOUT_MS + WIFI_DHCP_TIMEOUT_MS) / 1000 +
-                                BURST_MAX_FRAMES * TELEGRAM_TIMEOUT_MS / 1000,
+                                2 * DNS_LOOKUP_MAX_S + BURST_MAX_FRAMES * TG_POST_MAX_S,
               "WAKE_DEADLINE_S no longer covers the longest normal wake (config.h)");
 
 // Never stopped: every path after setup() arms it ends in deep sleep, which

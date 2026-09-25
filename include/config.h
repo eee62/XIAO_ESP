@@ -278,25 +278,44 @@
 // then back to sleep without the radio. Deployment mode is attended and never
 // sleeps, so it is never on the clock.
 //
-// This has to sit comfortably above the longest normal wake, which is a burst
-// held open to its cap and then delivered in full:
+// This has to sit above the longest wake that is slow but not hung: a burst
+// held open to its cap, then delivered in full over the worst uplink that
+// still works. Every term is a timeout or a cap in the code:
 //
 //     600 s  BURST_MAX_DURATION   burst held open until the cap
 //   +  30 s  BURST_SETTLE         a last settle sleep, ended by a trigger
 //   +  60 s  2 x PIR_IDLE_MAX_S   PIR held high after that trigger, and again
 //                                 before deep sleep (main.cpp)
 //   +  12 s  WIFI_CONNECT_TIMEOUT_MS + WIFI_DHCP_TIMEOUT_MS
-//   + 120 s  BURST_MAX_FRAMES x TELEGRAM_TIMEOUT_MS
-//   = 822 s
+//   +  42 s  2 x DNS lookup       wifi_reachable() on the static address,
+//                                 then on the DHCP lease
+//   + 368 s  BURST_MAX_FRAMES x 46 s, one tg_post() per frame
+//   = 1112 s
 //
-// 20 minutes is ~45% over that. The margin is for what those constants do not
-// bound: camera bring-up, detection, DNS lookups, and TLS requests that run
-// past TELEGRAM_TIMEOUT_MS (the handshake has its own TELEGRAM_HANDSHAKE_S,
-// and the upload is only checked between writes). main.cpp checks the sum at
-// compile time, so retuning a term past this fails the build instead of
-// cutting long bursts short. A hang that runs the full 20 minutes with the
-// radio up costs something like 30 mAh, a few days of the 7 budget, rather
-// than the cell.
+// A DNS lookup ends only when lwIP gives up: four tries per configured
+// server, 1, 1, 2 and 3 s apart, for up to CONFIG_LWIP_DNS_MAX_SERVERS (3)
+// servers, so 21 s. NetworkManager::hostByName() adds no timeout of its own.
+//
+// TELEGRAM_TIMEOUT_MS does not cap a tg_post(). telegram.cpp checks it only
+// after each body write, and ssl_client.cpp reuses it as the TCP connect
+// timeout and as how long one write may go without progress. A frame takes
+// the longer of two paths:
+//   - A slow connect, 46 s: connect() resolves TELEGRAM_HOST again (21 s; a
+//     cache hit only while the record's TTL lasts), then the TCP connect
+//     (15 s) and TELEGRAM_HANDSHAKE_S (10 s), and the first check fails. No
+//     write stall adds to this. The request head and the first
+//     TG_WRITE_CHUNK, ~4.4 kB between them, fit the empty 5744-byte TCP send
+//     buffer, so both writes return at once. That stops holding if
+//     TG_WRITE_CHUNK grows past the buffer.
+//   - A quick connect, 30 s: a check that passes at 15 s, then one write
+//     that stalls for the full 15 s.
+//
+// 20 minutes leaves 88 s for what the code does not bound: two camera
+// bring-ups and detection over BURST_MAX_FRAMES frames, seconds rather than
+// minutes. main.cpp checks the sum at compile time, so retuning a term past
+// this fails the build instead of cutting long bursts short. A hang that runs
+// the full 20 minutes with the radio up costs something like 30 mAh, a few
+// days of the 7 budget, rather than the cell.
 #define WAKE_DEADLINE_S          (20 * 60)
 
 // ---------------------------------------------------------------------------
