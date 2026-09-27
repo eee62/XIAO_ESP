@@ -139,6 +139,16 @@ static uint32_t          g_cold_seq     = 0;       // results published
 static cold_test_t       g_cold         = {};
 static blob_ref          g_cold_jpeg;
 
+// Test clip, the same way: g_clip without its buffer pointer, the file itself
+// in g_clip_avi.
+static volatile bool     g_clip_req     = false;
+static volatile uint32_t g_clip_req_ms  = 0;
+static bool              g_clip_running = false;
+static bool              g_clip_busy    = false;
+static uint32_t          g_clip_seq     = 0;
+static test_clip_t       g_clip         = {};
+static blob_ref          g_clip_avi;
+
 // PIR walk test.
 static bool     g_pir_level       = false;
 static uint32_t g_pir_edges       = 0;
@@ -362,9 +372,49 @@ static String status_json()
 	j += ",\"per_ep\":";        j += PHOTOS_PER_EPISODE;
 	j += ",\"gap\":";           j += PRESENCE_GAP_S;
 	j += ",\"hold\":";          j += PIR_HOLD_S;
+	j += ",\"clips_sent\":";    j += s.clips_sent_total;
+	j += ",\"clips_dropped\":"; j += s.clips_dropped_total;
+	j += ",\"clip_s\":";        j += s.clip_s_total;
+	j += ",\"v_on\":";          j += VIDEO_ENABLED ? "true" : "false";
+	j += ",\"v_w\":";           j += resolution[VIDEO_FRAMESIZE].width;
+	j += ",\"v_h\":";           j += resolution[VIDEO_FRAMESIZE].height;
+	j += ",\"v_q\":";           j += VIDEO_JPEG_QUALITY;
+	j += ",\"v_fps\":";         j += VIDEO_FPS;
+	j += ",\"v_max_s\":";       j += VIDEO_MAX_CLIP_S;
+	j += ",\"v_max_kb\":";      j += (uint32_t)(VIDEO_MAX_BYTES / 1024);
+	j += ",\"v_per_ep\":";      j += VIDEO_MAX_CLIPS_PER_EPISODE;
+	j += ",\"v_per_day\":";     j += VIDEO_MAX_CLIPS_PER_DAY;
+	j += ",\"v_person\":";      j += VIDEO_REQUIRE_PERSON ? "true" : "false";
+	j += ",\"v_min_s\":";       j += VIDEO_PRESENCE_MIN_S;
+	j += ",\"test_clip_s\":";   j += DEPLOY_TEST_CLIP_S;
 	j += ",\"sta_ssid\":\"";  j += json_escape(WIFI_SSID);
 	j += "\"";
 	j += ",\"telegram\":";     j += telegram_configured() ? "true" : "false";
+	j += "}";
+	return j;
+}
+
+static String clip_json()
+{
+	xSemaphoreTake(g_cam_lock, portMAX_DELAY);
+	const test_clip_t r       = g_clip;
+	const uint32_t    seq     = g_clip_seq;
+	const bool        running = g_clip_running || g_clip_req;
+	const bool        busy    = g_clip_busy;
+	xSemaphoreGive(g_cam_lock);
+
+	String j;
+	j.reserve(192);
+	j += "{\"seq\":";      j += seq;
+	j += ",\"running\":";  j += running ? "true" : "false";
+	j += ",\"busy\":";     j += busy ? "true" : "false";
+	j += ",\"ok\":";       j += r.ok ? "true" : "false";
+	j += ",\"frames\":";   j += r.frames;
+	j += ",\"dur_ms\":";   j += r.dur_ms;
+	j += ",\"fps\":";      j += String(r.fps, 2);
+	j += ",\"len\":";      j += (uint32_t)r.len;
+	j += ",\"w\":";        j += resolution[VIDEO_FRAMESIZE].width;
+	j += ",\"h\":";        j += resolution[VIDEO_FRAMESIZE].height;
 	j += "}";
 	return j;
 }
@@ -482,6 +532,8 @@ justify-content:center}
   <div class="sec">Cold capture &mdash; what a PIR wake produces</div>
   <div class="grid" id="cold"><div>Result</div><div>not run yet</div></div>
   <div class="row"><button id="coldbtn">Run cold capture</button></div>
+  <div class="grid" id="clip" style="margin-top:12px"></div>
+  <div class="row"><button id="clipbtn">Record test clip</button></div>
 </section>
 
 <section class="card pir">
@@ -571,8 +623,9 @@ function drawCentre(im){
 
 // Cold capture: the loop task cuts the rail, then runs the PIR wake's photo
 // path. The result arrives as a new seq on GET /coldtest.
-function coldRows(a){$('cold').innerHTML=a.map(function(r){
+function gridRows(id,a){$(id).innerHTML=a.map(function(r){
   return'<div>'+r[0]+'</div><div>'+r[1]+'</div>'}).join('')}
+function coldRows(a){gridRows('cold',a)}
 $('coldbtn').onclick=function(){stopFocus();pauseLive();
   $('vmsg').textContent='cold capture running…';
   coldRows([['Result','running: rail off, then a cold start…']]);
@@ -604,6 +657,29 @@ function coldShow(d){
   var v=$('view');v.onload=function(){v.className='shown';$('vmsg').textContent=''};
   v.onerror=function(){$('vmsg').textContent='could not load the capture'};
   v.src='/coldtest.jpg?'+d.seq}
+
+// Test clip: the presence-video settings for a few seconds, recorded on the
+// loop task, then offered as a download to open in Files, Photos or VLC.
+var clipSecs=5;
+$('clipbtn').onclick=function(){stopFocus();pauseLive();
+  $('vmsg').textContent='recording a test clip…';
+  gridRows('clip',[['Test clip','recording '+clipSecs+' s…']]);
+  fetch('/testclip',{method:'POST'}).then(function(r){return r.json()})
+    .then(function(j){clipPoll(j.seq)})
+    .catch(function(){gridRows('clip',[['Test clip','request failed']])})}
+function clipPoll(seq){fetch('/testclip',{cache:'no-store'})
+  .then(function(r){return r.json()})
+  .then(function(d){if(d.running||d.seq<=seq){
+    setTimeout(function(){clipPoll(seq)},500);return}clipShow(d)})
+  .catch(function(){setTimeout(function(){clipPoll(seq)},1000)})}
+function clipShow(d){
+  $('vmsg').textContent='preview paused';
+  if(d.busy){gridRows('clip',[['Test clip','camera busy; close other previews and retry']]);return}
+  if(!d.ok){gridRows('clip',[['Test clip','FAILED: no frames (see the serial log)']]);return}
+  gridRows('clip',[['Test clip',d.frames+' frames · '+d.fps.toFixed(2)+' fps · '+
+      (d.dur_ms/1000).toFixed(1)+' s'],
+    ['File',kb(d.len)+' · '+d.w+'×'+d.h+' MJPEG AVI'],
+    ['Download','<a href="/testclip.avi?'+d.seq+'" download="test.avi">test.avi</a>']])}
 
 function act(path,label,confirmText){
   if(!confirm(confirmText))return;
@@ -643,6 +719,12 @@ function render(d){
     d.capped+' over the visit cap');
   row('Detect errors',d.derr_total+' total · '+d.derr_since+' unreported');
   row('Last report',d.last_report?dur(d.uptime-d.last_report)+' ago':'never');
+  clipSecs=d.test_clip_s;
+  row('Clips',d.clips_sent+' sent · '+d.clips_dropped+' dropped · '+
+    dur(d.clip_s)+' recorded');
+  row('Video',!d.v_on?'off':d.v_w+'×'+d.v_h+' · q '+d.v_q+' · '+d.v_fps+' fps · ≤'+
+    d.v_max_s+' s or '+(d.v_max_kb/1024).toFixed(1)+' MB · after '+d.v_min_s+' s'+
+    (d.v_person?' + person':'')+' · '+d.v_per_ep+'/visit, '+d.v_per_day+'/day');
   row('Photo rule',(d.persons_only?'persons only':'everything')+
     ' · at most '+d.per_ep+' per visit');
   row('PIR timing','hold '+d.hold+' s (PIR_HOLD_S) · visit gap '+d.gap+' s');
@@ -803,6 +885,53 @@ static void install_routes()
 	g_server.on("/coldtest", HTTP_GET, [](AsyncWebServerRequest *req) {
 		AsyncWebServerResponse *res =
 		    req->beginResponse(200, "application/json", cold_json());
+		res->addHeader("Cache-Control", "no-store");
+		req->send(res);
+	});
+
+	// Record a test clip on the loop task (service_testclip()); the page polls
+	// GET /testclip, as for the cold capture.
+	g_server.on("/testclip", HTTP_POST, [](AsyncWebServerRequest *req) {
+		xSemaphoreTake(g_cam_lock, portMAX_DELAY);
+		const uint32_t seq  = g_clip_seq;
+		const bool     busy = g_clip_running || g_clip_req;
+		xSemaphoreGive(g_cam_lock);
+		if (!busy) {
+			g_clip_req_ms = millis();
+			g_clip_req    = true;
+		}
+		String j = "{\"seq\":";
+		j += seq;
+		j += "}";
+		req->send(202, "application/json", j);
+	});
+
+	g_server.on("/testclip", HTTP_GET, [](AsyncWebServerRequest *req) {
+		AsyncWebServerResponse *res =
+		    req->beginResponse(200, "application/json", clip_json());
+		res->addHeader("Cache-Control", "no-store");
+		req->send(res);
+	});
+
+	// The file, as a download: an attachment named test.avi, so a phone
+	// saves it for Files or VLC rather than trying to show it inline.
+	g_server.on("/testclip.avi", HTTP_GET, [](AsyncWebServerRequest *req) {
+		xSemaphoreTake(g_cam_lock, portMAX_DELAY);
+		blob_ref blob = g_clip_avi;
+		xSemaphoreGive(g_cam_lock);
+		if (!blob) {
+			req->send(404, "text/plain", "no test clip yet");
+			return;
+		}
+		AsyncWebServerResponse *res = req->beginResponse(
+		    "video/x-msvideo", blob->len,
+		    [blob](uint8_t *buf, size_t maxLen, size_t index) -> size_t {
+			    const size_t left = blob->len - index;
+			    const size_t n    = left < maxLen ? left : maxLen;
+			    memcpy(buf, blob->data + index, n);
+			    return n;
+		    });
+		res->addHeader("Content-Disposition", "attachment; filename=\"test.avi\"");
 		res->addHeader("Cache-Control", "no-store");
 		req->send(res);
 	});
@@ -1034,6 +1163,32 @@ static void service_still()
 	xSemaphoreGive(g_cam_lock);
 }
 
+// Take the camera for a job that runs its own bring-up on this task (the
+// cold capture, the test clip): no stream may hold a use. True, with the
+// sensor powered down and the mode SWITCHING, once it is free. False while a
+// stream still holds it; *refused once that has lasted as long as shutdown
+// would wait. The page stops its stream first, so a holder is a response the
+// async task has not torn down yet.
+static bool job_take_camera(uint32_t req_ms, bool *refused)
+{
+	xSemaphoreTake(g_cam_lock, portMAX_DELAY);
+	const bool       free = g_cam_users == 0;
+	const cam_mode_t from = g_cam_mode;
+	if (free) {
+		g_cam_mode = CAM_SWITCHING;
+	}
+	xSemaphoreGive(g_cam_lock);
+
+	*refused = !free && millis() - req_ms >= SHUTDOWN_DRAIN_TICKS * SERVICE_TICK_MS;
+	if (!free) {
+		return false;
+	}
+	if (from != CAM_OFF) {
+		camera_down();
+	}
+	return true;
+}
+
 // The cold-capture test: rail off for DEPLOY_COLDTEST_OFF_MS, then the PIR
 // wake's photo path (deploy_cold_test() in main.cpp). Blocks this task for
 // the few seconds it takes; the captive DNS and the PIR walk test wait.
@@ -1042,37 +1197,25 @@ static void service_coldtest()
 	if (!g_cold_req) {
 		return;
 	}
-
-	xSemaphoreTake(g_cam_lock, portMAX_DELAY);
-	const bool       free = g_cam_users == 0;
-	const cam_mode_t from = g_cam_mode;
-	if (free) {
-		g_cam_mode     = CAM_SWITCHING;
-		g_cold_running = true;
-	}
-	xSemaphoreGive(g_cam_lock);
-
-	if (!free) {
-		// The page stops its stream first, so this is a response the async
-		// task has not torn down yet. Give it the same second as shutdown.
-		if (millis() - g_cold_req_ms < SHUTDOWN_DRAIN_TICKS * SERVICE_TICK_MS) {
-			return;
+	bool refused = false;
+	if (!job_take_camera(g_cold_req_ms, &refused)) {
+		if (refused) {
+			g_cold_req = false;
+			xSemaphoreTake(g_cam_lock, portMAX_DELAY);
+			g_cold      = {};
+			g_cold_busy = true;
+			g_cold_jpeg.reset();
+			g_cold_seq++;
+			xSemaphoreGive(g_cam_lock);
+			log_w("cold-capture test refused: a stream still holds the camera");
 		}
-		g_cold_req = false;
-		xSemaphoreTake(g_cam_lock, portMAX_DELAY);
-		g_cold      = {};
-		g_cold_busy = true;
-		g_cold_jpeg.reset();
-		g_cold_seq++;
-		xSemaphoreGive(g_cam_lock);
-		log_w("cold-capture test refused: a stream still holds the camera");
 		return;
 	}
 	g_cold_req = false;
+	xSemaphoreTake(g_cam_lock, portMAX_DELAY);
+	g_cold_running = true;
+	xSemaphoreGive(g_cam_lock);
 
-	if (from != CAM_OFF) {
-		camera_down();
-	}
 	delay(DEPLOY_COLDTEST_OFF_MS);
 	log_i("cold-capture test: rail off for %d ms, running the photo path",
 	      DEPLOY_COLDTEST_OFF_MS);
@@ -1093,6 +1236,53 @@ static void service_coldtest()
 	g_cold_jpeg    = jpeg;
 	g_cold_seq++;
 	g_cold_running = false;
+	g_cam_mode     = CAM_OFF;
+	xSemaphoreGive(g_cam_lock);
+}
+
+// The test clip (deploy_test_clip() in main.cpp): DEPLOY_TEST_CLIP_S of the
+// presence-video settings, a few seconds of this task like the cold test.
+static void service_testclip()
+{
+	if (!g_clip_req) {
+		return;
+	}
+	bool refused = false;
+	if (!job_take_camera(g_clip_req_ms, &refused)) {
+		if (refused) {
+			g_clip_req = false;
+			xSemaphoreTake(g_cam_lock, portMAX_DELAY);
+			g_clip      = {};
+			g_clip_busy = true;
+			g_clip_avi.reset();
+			g_clip_seq++;
+			xSemaphoreGive(g_cam_lock);
+			log_w("test clip refused: a stream still holds the camera");
+		}
+		return;
+	}
+	g_clip_req = false;
+	// The last clip's buffer goes first: the new one is sized from what is
+	// free (config.h, VIDEO_MAX_BYTES).
+	xSemaphoreTake(g_cam_lock, portMAX_DELAY);
+	g_clip_running = true;
+	g_clip_avi.reset();
+	xSemaphoreGive(g_cam_lock);
+
+	test_clip_t r;
+	deploy_test_clip(&r);
+	blob_ref avi;
+	if (r.avi) {
+		avi   = blob_adopt(r.avi, r.len);
+		r.avi = nullptr;
+	}
+
+	xSemaphoreTake(g_cam_lock, portMAX_DELAY);
+	g_clip         = r;
+	g_clip_busy    = false;
+	g_clip_avi     = avi;
+	g_clip_seq++;
+	g_clip_running = false;
 	g_cam_mode     = CAM_OFF;
 	xSemaphoreGive(g_cam_lock);
 }
@@ -1165,6 +1355,7 @@ void deploy_mode_service()
 #endif
 	service_pir();
 	service_coldtest();
+	service_testclip();
 	service_camera();
 	service_still();
 	service_action();

@@ -41,6 +41,9 @@ struct deploy_status_t {
 	uint8_t  wind_streak;                 // no-person photos in a row
 	uint32_t backoff_left_s;              // 0 unless the PIR is being ignored
 	uint32_t backoff_s_total;             // seconds the PIR has been ignored
+	uint32_t clips_sent_total;
+	uint32_t clips_dropped_total;         // recorded, not delivered
+	uint32_t clip_s_total;                // seconds of clip recorded
 	uint32_t last_report_s;
 	bool     have_ap_cache;
 	uint8_t  ap_channel;
@@ -80,6 +83,19 @@ struct cold_test_t {
 	uint32_t infer_ms;
 };
 void deploy_cold_test(cold_test_t *out);
+
+// A DEPLOY_TEST_CLIP_S clip with the presence-video settings (config.h,
+// VIDEO_*), the PIR ignored, for the test-clip button. Loop task only, with
+// the camera already down.
+struct test_clip_t {
+	bool     ok;
+	uint8_t *avi;        // PSRAM, the finished file; the caller frees it
+	size_t   len;
+	uint32_t frames;
+	uint32_t dur_ms;
+	float    fps;        // measured, as written into the headers
+};
+void deploy_test_clip(test_clip_t *out);
 
 // ---------------------------------------------------------------------------
 // Provided by deploy_mode.cpp.

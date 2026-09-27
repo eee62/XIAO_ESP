@@ -649,3 +649,8 @@
 // it back up, so the sensor and its decoupling genuinely lose power, as they
 // do between PIR wakes (9.1 step 3).
 #define DEPLOY_COLDTEST_OFF_MS    1000
+
+// Deployment mode's test clip: this many seconds with the current VIDEO_*
+// settings, served as test.avi to download, for checking phone playback
+// without Telegram.
+#define DEPLOY_TEST_CLIP_S        5

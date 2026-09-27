@@ -774,6 +774,9 @@ void deploy_fill_status(deploy_status_t *out)
 	out->backoff_left_s             = rtc_backoff && (int32_t)(rtc_backoff_end_s - now_s()) > 0
 	                                      ? rtc_backoff_end_s - now_s() : 0;
 	out->backoff_s_total            = rtc_backoff_s_total;
+	out->clips_sent_total           = rtc_clips_sent_total;
+	out->clips_dropped_total        = rtc_clips_dropped_total;
+	out->clip_s_total               = (rtc_clip_ms_total + 500) / 1000;
 	out->last_report_s              = rtc_last_report_s;
 	out->have_ap_cache              = rtc_have_ap;
 	out->using_dhcp                 = rtc_use_dhcp;
@@ -1868,6 +1871,23 @@ static void video_check(bool edge, bool judged)
 	(void)edge;
 	(void)judged;
 #endif
+}
+
+// Deployment mode's test clip (deploy_mode.h): the same recorder as a
+// presence clip, with the PIR out of it.
+void deploy_test_clip(test_clip_t *out)
+{
+	memset(out, 0, sizeof(*out));
+	clip_t c;
+	if (!record_clip(&c, DEPLOY_TEST_CLIP_S, false)) {
+		return;
+	}
+	out->ok     = true;
+	out->avi    = c.buf;
+	out->len    = c.len;
+	out->frames = c.frames;
+	out->dur_ms = c.dur_ms;
+	out->fps    = c.fps;
 }
 
 // The episode time at which D1 still high proves motion, for the sleep timer.
