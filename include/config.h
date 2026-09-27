@@ -72,9 +72,34 @@
 // ---------------------------------------------------------------------------
 // Camera
 // ---------------------------------------------------------------------------
-// SVGA keeps the JPEG small (fast to send) and, more importantly, keeps the
-// decoded RGB888 buffer for detection at ~1.4 MB instead of ~5.8 MB at UXGA.
-#define CAM_FRAMESIZE        FRAMESIZE_SVGA  // 800x600
+// Stills at the largest size the installed OV5640 driver produces: QSXGA,
+// 2560 x 1920. FRAMESIZE_5MP (2592 x 1944, the sensor's full array) exists in
+// esp32-camera's enum, but the OV5640 entry in its sensor.c table caps at
+// QSXGA and esp_camera_init() clamps anything larger down to that with a
+// warning, so asking for 5MP buys nothing.
+//
+// Detection no longer limits this: it decodes at a reduced scale
+// (DETECT_DECODE_MAX_W), 640 x 480 from QSXGA. What does limit it is the lens
+// and the upload. A third-party fixed-focus lens may not resolve 5 MP. If a
+// 3 MP (FRAMESIZE_QXGA, 2048 x 1536) frame looks just as sharp in deployment
+// mode's focus view, the smaller size is the better trade: every byte costs
+// upload energy, and detection sees the same 640-wide decode either way.
+//
+// Size and memory at QSXGA:
+//   - The driver's JPEG buffer is w x h / 5 = 983 kB, so no still is bigger
+//     (CAM_QUALITY_STEP handles a scene that would be). A busy outdoor scene
+//     at quality 10 is typically 0.5-1 MB.
+//   - PSRAM while capturing: the driver's two buffers (2 x 983 kB) plus the
+//     one copy capture() keeps, ~3 MB. That is the high point for stills.
+//     Detection holds that copy, the 921 kB RGB888 decode and the model (the
+//     pedestrian weights are 435 kB), ~3 MB with its working memory, the
+//     driver's buffers already freed. Nothing buffers frames any more: each
+//     wake handles one still at a time, so there is no frame count to cap.
+//   - Uploading one: ~0.5 MB at ~200 kB/s is ~3 s on top of ~3 s of
+//     association and TLS, ~0.4 mAh at 7's 250 mA; a full 983 kB still is
+//     ~0.55 mAh. At the TELEGRAM_MIN_BPS floor a 983 kB still may take 62 s,
+//     ~4.5 mAh with the handshake. At SVGA it was ~100 kB and ~0.25 mAh.
+#define CAM_FRAMESIZE        FRAMESIZE_QSXGA
 // 0..63, lower = better = bigger.
 #define CAM_JPEG_QUALITY     10
 
@@ -166,9 +191,11 @@
 //   ~0.2 s boot, ~0.6 s cold init, CAM_WARMUP_MS, a frame   ~0.12 mAh
 //   detection: model load, a reduced decode, inference      ~0.04 mAh
 //   total for a photo that is judged and dropped            ~0.16-0.2 mAh
-//   sending it: association, TLS, and the upload            +~0.5 mAh at
-//     ~200 kB/s for a 1 MB 5 MP still; ~4.5 mAh at TELEGRAM_MIN_BPS
-// Against 7's ~9 mAh/day (8.2 of it sleep), ten person photos a day are ~7 mAh.
+//   sending it: association, TLS, and the upload            +~0.4-0.55 mAh
+//     for a QSXGA still at ~200 kB/s (see CAM_FRAMESIZE); ~4.5 mAh at the
+//     TELEGRAM_MIN_BPS floor
+// Against 7's ~9 mAh/day (8.2 of it sleep), ten person photos a day are
+// ~6-7 mAh.
 // ---------------------------------------------------------------------------
 
 // 1: only photos the detector scores at DETECT_SCORE_THRESHOLD or above go
@@ -526,12 +553,12 @@
 //
 //       30 s  PIR_IDLE_MAX_S       D1 waited out before the idle sleep
 //                                  (main.cpp)
-//   +  304 s  2 x (54 + 98 s)      two stills: an association and a
+//   +  414 s  2 x (54 + 153 s)     two stills: an association and a
 //                                  tg_post() each
 //   + 1314 s  3 x (30 + 54 + 354)  the clips: VIDEO_MAX_CLIP_S of recording,
 //                                  an association and a tg_post() of
 //                                  VIDEO_MAX_BYTES each
-//   = 1648 s
+//   = 1758 s
 //
 // An association is at most 54 s: WIFI_CONNECT_TIMEOUT_MS +
 // WIFI_DHCP_TIMEOUT_MS, and a DNS lookup in wifi_reachable() on the static
@@ -550,11 +577,11 @@
 //            writes, and a write returns only on progress or a full stall
 // For a still, B is the driver's frame buffer at CAM_FRAMESIZE (w x h / 5; a
 // bigger frame never reaches PSRAM) plus 1.5 kB of multipart head and tail.
-// At SVGA that is 97.5 kB, 7 s at the floor rate: 46 + 30 + 7 + 15 = 98 s.
+// At QSXGA that is 985 kB, 62 s at the floor rate: 46 + 30 + 62 + 15 = 153 s.
 // For a clip, B is VIDEO_MAX_BYTES plus the same, 263 s at the floor rate for
 // 4 MB: 46 + 30 + 263 + 15 = 354 s.
 //
-// 32 minutes leaves 272 s for what no single timeout bounds: two captures,
+// 32 minutes leaves 162 s for what no single timeout bounds: two captures,
 // ~10 s each at worst (init, CAM_WARMUP_MS, and two 4 s fb_get() timeouts when
 // a frame overflows its buffer), two detections of seconds each, and three
 // video bring-ups of about a second. main.cpp checks the sum at compile time,
