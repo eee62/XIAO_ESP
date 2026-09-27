@@ -582,6 +582,65 @@ static dl::image::img_t decode_for_detect(const frame_t &f)
 	return img;
 }
 
+// Construct the detector with the configured threshold and load its model.
+// nullptr if there is no memory for it. *load_ms is the whole of that.
+//
+// Both models load lazily inside their first run() by default, which would
+// bill the load to the first frame's inference time. get_raw_model() loads
+// it here instead, so the per-frame numbers mean what they say.
+static detector_t *detector_open(uint32_t *load_ms)
+{
+	const uint32_t t0 = millis();
+	detector_t *det = new (std::nothrow) detector_t();
+	if (!det) {
+		return nullptr;
+	}
+	// Push the configured threshold into the model's own postprocessor (9.2:
+	// "the detection-confidence threshold should be configurable"). Without
+	// this the model filters at its compiled-in default first — 0.7 for
+	// pedestrian, 0.5 for face — and a lower DETECT_SCORE_THRESHOLD would
+	// silently do nothing, since the post-filter can only tighten.
+	det->set_score_thr(DETECT_SCORE_THRESHOLD);
+#if DETECT_MODEL == DETECT_MODEL_FACE
+	// The face model is two-stage (MSR then MNP); both stages need the threshold.
+	det->set_score_thr(DETECT_SCORE_THRESHOLD, 1);
+#endif
+	det->get_raw_model();
+	*load_ms = millis() - t0;
+	return det;
+}
+
+// Judge one frame: sets f.score and f.hit, or f.err when it cannot be
+// decoded. Returns false on the error. Decode and inference are timed apart,
+// since both sit on the path of every photo.
+static bool detect_frame(detector_t *det, frame_t &f, uint32_t *dec_ms,
+                         uint32_t *inf_ms)
+{
+	const uint32_t t_dec = millis();
+	dl::image::img_t img = decode_for_detect(f);
+	*dec_ms = millis() - t_dec;
+	*inf_ms = 0;
+	if (!img.data) {
+		f.err = true;
+		return false;
+	}
+
+	const uint32_t t_inf = millis();
+	auto &results = det->run(img);
+	for (const auto &r : results) {
+		if (r.score > f.score) {
+			f.score = r.score;
+		}
+	}
+	*inf_ms = millis() - t_inf;
+	heap_caps_free(img.data);
+	f.hit = f.score >= DETECT_SCORE_THRESHOLD;
+	log_i("%ux%u decode %lu ms, inference %lu ms, best score %.2f%s",
+	      img.width, img.height, (unsigned long)*dec_ms, (unsigned long)*inf_ms,
+	      f.score, f.hit ? " HIT" : "");
+	return true;
+}
+
 // Returns the number of buffered frames containing a human, and tags each
 // frame with its best score. Frames the detector could not judge are flagged
 // `err` and counted in *errors instead: they are neither hits nor
@@ -602,8 +661,9 @@ static int detect_over_buffer(void (*on_first_hit)(), int *errors)
 		return 0;
 	}
 
-	uint32_t t0 = millis();
-	detector_t *det = new (std::nothrow) detector_t();
+	const uint32_t t0 = millis();
+	uint32_t load_ms = 0;
+	detector_t *det = detector_open(&load_ms);
 	if (!det) {
 		// Out of memory for the model. Fail open: a frame we could not judge
 		// is better sent than silently dropped.
@@ -617,59 +677,27 @@ static int detect_over_buffer(void (*on_first_hit)(), int *errors)
 		*errors = g_burst_n;
 		return 0;
 	}
-
-	// Push the configured threshold into the model's own postprocessor (9.2:
-	// "the detection-confidence threshold should be configurable"). Without
-	// this the model filters at its compiled-in default first — 0.7 for
-	// pedestrian, 0.5 for face — and a lower DETECT_SCORE_THRESHOLD would
-	// silently do nothing, since the post-filter below can only tighten.
-	det->set_score_thr(DETECT_SCORE_THRESHOLD);
-#if DETECT_MODEL == DETECT_MODEL_FACE
-	// The face model is two-stage (MSR then MNP); both stages need the threshold.
-	det->set_score_thr(DETECT_SCORE_THRESHOLD, 1);
-#endif
+	log_i("%s model loaded in %lu ms", DETECT_MODEL_NAME, (unsigned long)load_ms);
 
 	int hits = 0;
 	for (int i = 0; i < g_burst_n; i++) {
 		frame_t &f = g_burst[i];
-		const uint32_t t_dec = millis();
-		dl::image::img_t img = decode_for_detect(f);
-		const uint32_t dec_ms = millis() - t_dec;
-		if (!img.data) {
+		uint32_t dec_ms, inf_ms;
+		log_i("frame %d:", i);
+		if (!detect_frame(det, f, &dec_ms, &inf_ms)) {
 			// Fail open, as for the model allocation above.
 			log_w("frame %d: jpeg decode failed after %lu ms; sending unjudged",
 			      i, (unsigned long)dec_ms);
-			f.err = true;
 			(*errors)++;
-			if (hits + *errors == 1 && on_first_hit) {
-				on_first_hit();
-			}
-			continue;
-		}
-
-		const uint32_t t_inf = millis();
-		auto &results = det->run(img);
-		for (const auto &r : results) {
-			if (r.score > f.score) {
-				f.score = r.score;
-			}
-		}
-		const uint32_t inf_ms = millis() - t_inf;
-		heap_caps_free(img.data);
-
-		if (f.score >= DETECT_SCORE_THRESHOLD) {
-			f.hit = true;
+		} else if (f.hit) {
 			hits++;
-			if (hits + *errors == 1 && on_first_hit) {
-				// This burst is going out. Start the radio now so the
-				// handshake runs against the remaining frames' inference
-				// rather than after it.
-				on_first_hit();
-			}
 		}
-		log_i("frame %d: %ux%u decode %lu ms, inference %lu ms, best score "
-		      "%.2f%s", i, img.width, img.height, (unsigned long)dec_ms,
-		      (unsigned long)inf_ms, f.score, f.hit ? " HIT" : "");
+		if ((f.hit || f.err) && hits + *errors == 1 && on_first_hit) {
+			// This burst is going out. Start the radio now so the handshake
+			// runs against the remaining frames' inference rather than
+			// after it.
+			on_first_hit();
+		}
 	}
 
 	delete det;
