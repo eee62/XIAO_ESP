@@ -75,8 +75,59 @@
 // SVGA keeps the JPEG small (fast to send) and, more importantly, keeps the
 // decoded RGB888 buffer for detection at ~1.4 MB instead of ~5.8 MB at UXGA.
 #define CAM_FRAMESIZE        FRAMESIZE_SVGA  // 800x600
-#define CAM_JPEG_QUALITY     12              // 0..63, lower = better = bigger
+// 0..63, lower = better = bigger.
+#define CAM_JPEG_QUALITY     10
 #define CAM_XCLK_HZ          20000000
+
+// Sensor settings, applied by camera_apply_settings() after every init: the
+// rail is cut between captures, so each wake starts from the driver's register
+// table (9.1 step 3). Deployment mode's preview goes through the same
+// camera_up(), so what it shows is what a PIR capture gets.
+//
+// Each default is the value the installed ov5640.c's register table already
+// loads, checked setter by setter, so a stock build writes nothing new. Only
+// CAM_JPEG_QUALITY above differs from before. CAM_KEEP means "do not call the
+// setter", for the two settings whose setter cannot reproduce the table.
+#define CAM_KEEP             99
+
+// Orientation. 0/0 is the sensor's own; check it in the deployment preview.
+#define CAM_VFLIP            0
+#define CAM_HMIRROR          0
+
+// ISP blocks in 0x5000, all on in the table (0xa7): lens shading correction,
+// black- and white-pixel correction, raw gamma. 1 = on.
+#define CAM_LENC             1
+#define CAM_BPC              1
+#define CAM_WPC              1
+#define CAM_RAW_GMA          1
+
+// -5..5 or CAM_KEEP. set_ae_level(0) targets a luminance of 55, brighter than
+// the table's own AEC window (0x3A0F/10 = 0x30/0x28, about level -1, which no
+// level reproduces exactly), so any value here is a change, not a default.
+#define CAM_AE_LEVEL         CAM_KEEP
+
+// AGC ceiling as the *raw* 0x3A18/19 value, in the sensor's 1/16 gain steps:
+// ov5640.c's set_gainceiling() writes its argument straight into those two
+// registers. The table has 0x0F8 = 248 = 15.5x. Do not pass a GAINCEILING_xX
+// enum here: those are 0..6, which this driver would write as a ceiling of
+// under 0.4x.
+#define CAM_GAINCEILING      248
+
+// -3..3 or CAM_KEEP. The table leaves sharpening automatic (0x5308 bit 6
+// set); set_sharpness() clears that bit and switches to fixed offsets, so any
+// value here gives up the automatic mode.
+#define CAM_SHARPNESS        CAM_KEEP
+
+// 0..8. 0 leaves 0x5308 bit 4 clear, as the table has it; 1..8 set it and
+// write (n - 1) x 4 to 0x5306.
+#define CAM_DENOISE          0
+
+// 0x3A00 bit 2, the only thing set_aec2() touches. ov5640.c does not name the
+// bit; it is usually described as the OV5640's night mode, which lets AEC
+// stretch exposure past a frame in low light. Off: a longer exposure blurs a
+// walking subject. Written explicitly rather than left to the sensor's reset
+// value, which the register table does not set.
+#define CAM_AEC2             0
 
 // ---------------------------------------------------------------------------
 // Burst filter — PROJECT_BRIEF.md 9.2

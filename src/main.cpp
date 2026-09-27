@@ -247,6 +247,45 @@ static void camera_pins_quiesce()
 	}
 }
 
+// Sensor settings after every init (config.h). Each setter's own register
+// writes are in ov5640.c; config.h says what each default reproduces. A
+// failed write is logged and the capture goes ahead on the table values: a
+// slightly different picture beats no picture.
+static void camera_apply_settings()
+{
+	sensor_t *s = esp_camera_sensor_get();
+	if (!s) {
+		return;
+	}
+	// CAM_GAINCEILING is a raw OV5640 register value, and the other sensors
+	// esp32-camera drives read these setters differently.
+	if (s->id.PID != OV5640_PID) {
+		log_w("sensor PID 0x%x is not an OV5640; settings left at defaults",
+		      s->id.PID);
+		return;
+	}
+
+	int err = 0;
+	err |= s->set_vflip(s, CAM_VFLIP);
+	err |= s->set_hmirror(s, CAM_HMIRROR);
+	err |= s->set_lenc(s, CAM_LENC);
+	err |= s->set_bpc(s, CAM_BPC);
+	err |= s->set_wpc(s, CAM_WPC);
+	err |= s->set_raw_gma(s, CAM_RAW_GMA);
+#if CAM_AE_LEVEL != CAM_KEEP
+	err |= s->set_ae_level(s, CAM_AE_LEVEL);
+#endif
+	err |= s->set_gainceiling(s, (gainceiling_t)CAM_GAINCEILING);
+#if CAM_SHARPNESS != CAM_KEEP
+	err |= s->set_sharpness(s, CAM_SHARPNESS);
+#endif
+	err |= s->set_denoise(s, CAM_DENOISE);
+	err |= s->set_aec2(s, CAM_AEC2);
+	if (err) {
+		log_w("one or more sensor settings failed to apply");
+	}
+}
+
 bool camera_up()
 {
 	camera_power_on();
@@ -297,6 +336,7 @@ bool camera_up()
 		camera_power_off();
 		return false;
 	}
+	camera_apply_settings();
 	return true;
 }
 
