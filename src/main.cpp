@@ -38,6 +38,7 @@
 #include <driver/rtc_io.h>
 #include <sys/time.h>
 
+#include "avi.h"
 #include "config.h"
 #include "deploy_mode.h"
 #include "telegram.h"
@@ -82,6 +83,9 @@
 // "Never" for rtc_last_report_attempt_s. Not 0: now_s() legitimately returns
 // 0 during the first second after a cold boot.
 #define REPORT_NEVER 0xFFFFFFFFu
+
+// Empty slot in the clip-time ring, for the same reason.
+#define CLIP_SLOT_EMPTY 0xFFFFFFFFu
 
 // Marks rtc_reset_stats as initialised; anything else in there is garbage.
 #define RESET_STATS_MAGIC 0x52535431u   // "RST1"
@@ -133,6 +137,9 @@ struct episode_t {
 	bool     d1_high;       // D1 as last seen
 	uint8_t  photos_sent;   // against PHOTOS_PER_EPISODE
 	uint8_t  person;        // EP_PERSON_*: did any photo in it hold a person
+	bool     fresh_checked; // the one fresh person check has been spent
+	bool     video_done;    // no more clips this episode
+	uint8_t  clips;         // recorded, against VIDEO_MAX_CLIPS_PER_EPISODE
 	uint64_t start_ms;      // now_ms() at the edge that opened it
 	uint64_t fall_ms;       // now_ms() when D1 last fell
 };
@@ -152,6 +159,18 @@ RTC_DATA_ATTR static uint32_t rtc_listen_s        = 0;
 // the triggers that could not be counted meanwhile.
 RTC_DATA_ATTR static uint32_t rtc_backoff_s_total = 0;
 RTC_DATA_ATTR static uint32_t rtc_backoff_s_since_report = 0;
+
+// Presence clips (config.h). Start times of the last VIDEO_MAX_CLIPS_PER_DAY,
+// a ring, for the rolling 24 h cap; CLIP_SLOT_EMPTY when unused. Clips sent,
+// dropped (recorded but not delivered), and recorded milliseconds.
+RTC_DATA_ATTR static uint32_t rtc_clip_times[VIDEO_MAX_CLIPS_PER_DAY];
+RTC_DATA_ATTR static uint8_t  rtc_clip_head = 0;
+RTC_DATA_ATTR static uint32_t rtc_clips_sent_total = 0;
+RTC_DATA_ATTR static uint32_t rtc_clips_sent_since_report = 0;
+RTC_DATA_ATTR static uint32_t rtc_clips_dropped_total = 0;
+RTC_DATA_ATTR static uint32_t rtc_clips_dropped_since_report = 0;
+RTC_DATA_ATTR static uint32_t rtc_clip_ms_total = 0;
+RTC_DATA_ATTR static uint32_t rtc_clip_ms_since_report = 0;
 
 // Cached association parameters (9.4) — skips the scan on every wake.
 RTC_DATA_ATTR static bool     rtc_have_ap = false;
@@ -323,7 +342,9 @@ static void camera_apply_settings()
 	}
 }
 
-bool camera_up()
+// Power up and cold-init the sensor at `size` and `quality`: stills use
+// camera_up(), the presence clips VIDEO_FRAMESIZE / VIDEO_JPEG_QUALITY.
+static bool camera_up_as(framesize_t size, int quality)
 {
 	camera_power_on();
 
@@ -348,8 +369,8 @@ bool camera_up()
 	cfg.ledc_timer   = LEDC_TIMER_0;
 	cfg.ledc_channel = LEDC_CHANNEL_0;
 	cfg.pixel_format = PIXFORMAT_JPEG;
-	cfg.frame_size   = CAM_FRAMESIZE;
-	cfg.jpeg_quality = rtc_cam_quality;
+	cfg.frame_size   = size;
+	cfg.jpeg_quality = quality;
 	// Two buffers, not one, so a discarded warm-up frame does not also cost
 	// the frame after it. In the installed cam_hal.c a JPEG frame ends at the
 	// VSYNC that starts the next one; cam_task() then queues it and looks for
@@ -375,6 +396,11 @@ bool camera_up()
 	}
 	camera_apply_settings();
 	return true;
+}
+
+bool camera_up()
+{
+	return camera_up_as(CAM_FRAMESIZE, rtc_cam_quality);
 }
 
 void camera_down()
@@ -1108,6 +1134,18 @@ static String telemetry_text(const char *reason, float score, int idx, int total
 	c += rtc_detect_errors_total;
 	c += " (+";
 	c += rtc_detect_errors_since_report;
+	c += ")\nclips sent ";
+	c += rtc_clips_sent_total;
+	c += " (+";
+	c += rtc_clips_sent_since_report;
+	c += "), dropped ";
+	c += rtc_clips_dropped_total;
+	c += " (+";
+	c += rtc_clips_dropped_since_report;
+	c += "), ";
+	c += (rtc_clip_ms_total + 500) / 1000;
+	c += " s recorded (+";
+	c += (rtc_clip_ms_since_report + 500) / 1000;
 	c += ")\nPIR ignored (wind) ";
 	c += rtc_backoff_s_total;
 	c += " s (+";
@@ -1155,6 +1193,9 @@ static void report_landed()
 	rtc_photos_dropped_since_report = 0;
 	rtc_capped_since_report         = 0;
 	rtc_backoff_s_since_report      = 0;
+	rtc_clips_sent_since_report     = 0;
+	rtc_clips_dropped_since_report  = 0;
+	rtc_clip_ms_since_report        = 0;
 	rtc_last_report_s               = now_s();
 }
 
@@ -1418,8 +1459,10 @@ static void backoff_finish()
 // One PIR trigger: a rising edge that opened an episode or continued one.
 // The capture comes first and nothing is allowed in front of it, the radio
 // least of all (9.1). Detection judges the photo with the radio still off,
-// and the radio comes up only for a photo that is going out.
-static void handle_trigger(uint32_t t_ref_ms)
+// and the radio comes up only for a photo that is going out. Returns true
+// when a photo was taken and judged, which the video gate can use as its
+// fresh check.
+static bool handle_trigger(uint32_t t_ref_ms)
 {
 	const uint32_t t = now_s();
 	if (t - rtc_listen_s >= (uint32_t)WIND_QUIET_RESET_S &&
@@ -1436,14 +1479,15 @@ static void handle_trigger(uint32_t t_ref_ms)
 		rtc_capped_since_report++;
 		log_i("trigger counted, not photographed: episode already has %d photos",
 		      PHOTOS_PER_EPISODE);
-		return;
+		return false;
 	}
 
 	frame_t f = {};
 	if (!capture(&f, t_ref_ms)) {
 		log_e("capture failed");
-		return;
+		return false;
 	}
+	bool judged = false;
 
 	bool        send;
 	const char *reason;
@@ -1458,9 +1502,11 @@ static void handle_trigger(uint32_t t_ref_ms)
 		rtc_ep.person     = EP_PERSON_YES;
 		rtc_wind_streak   = 0;
 		rtc_backoff_level = 0;
+		judged = true;
 		send   = true;
 		reason = "person";
 	} else {
+		judged = true;
 		if (rtc_ep.person == EP_PERSON_UNCHECKED) {
 			rtc_ep.person = EP_PERSON_NO;
 		}
@@ -1489,6 +1535,345 @@ static void handle_trigger(uint32_t t_ref_ms)
 	if (rtc_wind_streak >= WIND_STREAK_BACKOFF) {
 		backoff_start();
 	}
+	return judged;
+}
+
+// ---------------------------------------------------------------------------
+// Presence video (config.h)
+// ---------------------------------------------------------------------------
+enum clip_end_t { CLIP_END_QUIET = 0, CLIP_END_TIME, CLIP_END_FULL, CLIP_END_CAMERA };
+static const char *const CLIP_END_NAMES[] = {
+	"PIR quiet", "time cap", "buffer full", "camera error",
+};
+
+struct clip_t {
+	uint8_t   *buf;         // PSRAM: the finished AVI; the caller frees it
+	size_t     len;
+	uint32_t   frames;
+	uint32_t   dur_ms;
+	float      fps;
+	clip_end_t end;
+	int        pir_edges;   // rising edges while recording: same visitor
+};
+
+// Record one clip with the radio off, and cut the camera before returning
+// (9.1 step 5). `max_s` caps its length; with `follow_pir` it also ends once
+// D1 has been low for VIDEO_END_QUIET_S. False, with nothing left allocated,
+// if no frame was recorded.
+static bool record_clip(clip_t *out, uint32_t max_s, bool follow_pir)
+{
+	memset(out, 0, sizeof(*out));
+	if (!camera_up_as(VIDEO_FRAMESIZE, VIDEO_JPEG_QUALITY)) {
+		log_e("clip: camera did not start");
+		return false;
+	}
+
+	// Sized after the camera has taken its own two frame buffers, so they
+	// are already out of the largest free block.
+	const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+	size_t cap = largest > (size_t)VIDEO_PSRAM_RESERVE ? largest - VIDEO_PSRAM_RESERVE : 0;
+	if (cap > (size_t)VIDEO_MAX_BYTES) {
+		cap = VIDEO_MAX_BYTES;
+	}
+	uint8_t *buf = cap >= 64 * 1024 ? (uint8_t *)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM)
+	                                : nullptr;
+	if (!buf) {
+		log_e("clip: no PSRAM for a buffer (largest free block %u)", (unsigned)largest);
+		camera_down();
+		return false;
+	}
+	log_i("clip: %u-byte buffer, largest free PSRAM block was %u",
+	      (unsigned)cap, (unsigned)largest);
+
+	// Frames are taken on a VIDEO_FPS schedule from the sensor's faster
+	// stream (GRAB_LATEST hands over the newest), the first no earlier than
+	// VIDEO_WARMUP_MS after init. A late frame does not push the schedule
+	// back; after a long stall it restarts instead of bursting to catch up.
+	avi_t avi;
+	bool  begun = false;
+	const uint32_t interval_ms = 1000 / VIDEO_FPS;
+	uint32_t next_due  = millis() + VIDEO_WARMUP_MS;
+	uint32_t t_first   = 0;
+	uint32_t low_since = 0;
+	bool     was_high  = gpio_get_level(PIN_PIR) == 1;
+	clip_end_t end     = CLIP_END_TIME;
+	for (;;) {
+		camera_fb_t *fb = esp_camera_fb_get();
+		if (!fb) {
+			end = CLIP_END_CAMERA;
+			break;
+		}
+		const uint32_t fs = fb_start_ms(fb);
+		if ((int32_t)(fs - next_due) >= 0) {
+			if (!begun) {
+				begun   = avi_begin(&avi, buf, cap, fb->width, fb->height, VIDEO_FPS);
+				t_first = fs;
+			}
+			const uint64_t t_us = (uint64_t)fb->timestamp.tv_sec * 1000000u +
+			                      (uint64_t)fb->timestamp.tv_usec;
+			if (!begun || !avi_add_frame(&avi, fb->buf, fb->len, t_us)) {
+				esp_camera_fb_return(fb);
+				end = CLIP_END_FULL;
+				break;
+			}
+			next_due += interval_ms;
+			if ((int32_t)(fs - next_due) > (int32_t)interval_ms) {
+				next_due = fs + interval_ms;
+			}
+		}
+		esp_camera_fb_return(fb);
+
+		const uint32_t now = millis();
+		if (begun && now - t_first >= max_s * 1000u) {
+			end = CLIP_END_TIME;
+			break;
+		}
+		if (follow_pir) {
+			const bool high = gpio_get_level(PIN_PIR) == 1;
+			if (high && !was_high) {
+				out->pir_edges++;
+			}
+			was_high = high;
+			if (high) {
+				low_since = 0;
+			} else if (low_since == 0) {
+				low_since = now | 1;
+			} else if (now - low_since >= (uint32_t)VIDEO_END_QUIET_S * 1000u) {
+				end = CLIP_END_QUIET;
+				break;
+			}
+		}
+	}
+	camera_down();
+
+	if (!begun || avi.frames == 0) {
+		log_e("clip: no frames recorded (%s)", CLIP_END_NAMES[end]);
+		heap_caps_free(buf);
+		return false;
+	}
+	out->frames = avi.frames;
+	out->dur_ms = avi_duration_us(&avi) / 1000;
+	out->fps    = avi_fps(&avi);
+	out->len    = avi_finish(&avi);
+	out->buf    = buf;
+	out->end    = end;
+	log_i("clip: %lu frames, %.2f fps, %.1f s, %u bytes, ended on %s, "
+	      "%d PIR edges while recording", (unsigned long)out->frames, out->fps,
+	      out->dur_ms / 1000.0f, (unsigned)out->len, CLIP_END_NAMES[end],
+	      out->pir_edges);
+	return true;
+}
+
+// Send a recorded clip: radio up, upload, radio down. Counted as sent before
+// the caption is built and taken back if the upload fails, as for photos.
+static bool send_clip(const clip_t &c)
+{
+	String why = "clip ";
+	why += String(c.dur_ms / 1000.0f, 1);
+	why += " s, ";
+	why += String(c.fps, 1);
+	why += " fps, ";
+	why += c.frames;
+	why += " frames, ";
+	why += (uint32_t)((c.len + 512) / 1024);
+	why += " kB, ended: ";
+	why += CLIP_END_NAMES[c.end];
+	why += "\nperson this visit: ";
+	why += rtc_ep.person == EP_PERSON_YES ? "yes" :
+	       rtc_ep.person == EP_PERSON_NO  ? "no"  : "not checked";
+
+	bool ok = false;
+	if (telegram_configured()) {
+		rtc_last_report_attempt_s = now_s();   // the caption carries telemetry
+		if (wifi_up()) {
+			rtc_clips_sent_total++;
+			rtc_clips_sent_since_report++;
+			const String cap = telemetry_text(why.c_str(), 0.0f, 0, 0);
+			ok = telegram_send_file("sendDocument", "document", "clip.avi",
+			                        "video/x-msvideo", c.buf, c.len, cap);
+			if (!ok) {
+				rtc_clips_sent_total--;
+				rtc_clips_sent_since_report--;
+			}
+		}
+		wifi_down();
+	} else {
+		log_e("no Telegram credentials compiled in (include/secrets.h)");
+	}
+
+	if (ok) {
+		report_landed();
+	} else {
+		log_w("clip not delivered, dropped");
+		rtc_clips_dropped_total++;
+		rtc_clips_dropped_since_report++;
+	}
+	return ok;
+}
+
+static int clips_last_day()
+{
+	const uint32_t t = now_s();
+	int n = 0;
+	for (int i = 0; i < VIDEO_MAX_CLIPS_PER_DAY; i++) {
+		const uint32_t e = rtc_clip_times[i];
+		if (e != CLIP_SLOT_EMPTY && t - e < 24u * 3600u) {
+			n++;
+		}
+	}
+	return n;
+}
+
+#if VIDEO_REQUIRE_PERSON
+// The gate's one fresh still for an episode with no person seen yet (config.h,
+// VIDEO_REQUIRE_PERSON): a person there is sent as a photo and lets the clip
+// start; otherwise the episode gets no clip.
+static void fresh_check()
+{
+	rtc_ep.fresh_checked = true;
+	log_i("no person seen this visit yet: one fresh check");
+	frame_t f = {};
+	if (!capture(&f, millis())) {
+		log_e("fresh check: capture failed");
+		return;
+	}
+	if (!judge_frame(f)) {
+		// Fail open for the photo, which goes out unjudged as any other would;
+		// a clip still needs a confirmed person.
+		rtc_detect_errors_total++;
+		rtc_detect_errors_since_report++;
+		if (rtc_ep.photos_sent < PHOTOS_PER_EPISODE &&
+		    send_photo(f, "detect error: sent unjudged (10 s check)")) {
+			rtc_ep.photos_sent++;
+		}
+	} else if (f.hit) {
+		rtc_ep.person     = EP_PERSON_YES;
+		rtc_wind_streak   = 0;
+		rtc_backoff_level = 0;
+		// Sent before the clip, so the upload finishes before recording
+		// starts and the photo is not lost to a clip that fills PSRAM.
+		if (rtc_ep.photos_sent < PHOTOS_PER_EPISODE &&
+		    send_photo(f, "person (10 s check)")) {
+			rtc_ep.photos_sent++;
+		}
+	} else {
+		rtc_ep.person = EP_PERSON_NO;
+		if (rtc_wind_streak < 255) {
+			rtc_wind_streak++;
+		}
+		rtc_suppressed_total++;
+		rtc_suppressed_since_report++;
+		log_i("fresh check: no person (best %.2f); no clip this visit", f.score);
+	}
+	heap_caps_free(f.data);
+}
+#endif
+
+// Clips for as long as the visit and the caps allow, each sent before the
+// next is recorded.
+static void video_run()
+{
+	for (;;) {
+		if (rtc_ep.clips >= VIDEO_MAX_CLIPS_PER_EPISODE ||
+		    clips_last_day() >= VIDEO_MAX_CLIPS_PER_DAY) {
+			log_i("clip caps reached (%u this visit, %d in 24 h)", rtc_ep.clips,
+			      clips_last_day());
+			rtc_ep.video_done = true;
+			return;
+		}
+		const uint32_t t_start = now_s();
+		clip_t c;
+		if (!record_clip(&c, VIDEO_MAX_CLIP_S, true)) {
+			rtc_ep.video_done = true;
+			return;
+		}
+		// Counted against the caps once something was actually recorded.
+		rtc_clip_times[rtc_clip_head] = t_start;
+		rtc_clip_head = (rtc_clip_head + 1) % VIDEO_MAX_CLIPS_PER_DAY;
+		rtc_ep.clips++;
+		rtc_clip_ms_total        += c.dur_ms;
+		rtc_clip_ms_since_report += c.dur_ms;
+		const bool sent = send_clip(c);
+		heap_caps_free(c.buf);
+
+		if (!sent) {
+			// The uplink is down; the next clip would be dropped as well.
+			log_w("no more clips this visit");
+			rtc_ep.video_done = true;
+			return;
+		}
+		if (c.end == CLIP_END_QUIET) {
+			// D1 low for VIDEO_END_QUIET_S is longer than PRESENCE_GAP_S: the
+			// visit is over.
+			episode_close("D1 quiet during a clip");
+			return;
+		}
+		if (gpio_get_level(PIN_PIR) == 0) {
+			// Stopped on a cap with the visitor apparently gone. The episode
+			// runs on: a new edge in it proves motion again.
+			rtc_ep.d1_high = false;
+			rtc_ep.fall_ms = now_ms();
+			return;
+		}
+		log_i("clip stopped on %s with D1 still high: another", CLIP_END_NAMES[c.end]);
+	}
+}
+
+// Called once per wake, after any trigger: has motion now been proven at
+// episode time T >= VIDEO_PRESENCE_MIN_S? `edge` is a rising edge at this
+// wake; `judged` says its photo was judged, which serves as the fresh check
+// when that edge is what proved motion.
+static void video_check(bool edge, bool judged)
+{
+#if VIDEO_ENABLED
+	if (!rtc_ep.open || rtc_ep.video_done) {
+		return;
+	}
+	const uint64_t age = now_ms() - rtc_ep.start_ms;
+	const bool     d1  = gpio_get_level(PIN_PIR) == 1;
+	const bool by_edge = edge && age >= (uint64_t)VIDEO_PRESENCE_MIN_S * 1000u;
+	const bool by_hold = d1 && age >= (uint64_t)(VIDEO_PRESENCE_MIN_S + PIR_HOLD_S) * 1000u;
+	if (!by_edge && !by_hold) {
+		return;
+	}
+	log_i("motion proven %lu s into the visit (%s)", (unsigned long)(age / 1000),
+	      by_edge ? "new edge" : "D1 still high");
+	if (clips_last_day() >= VIDEO_MAX_CLIPS_PER_DAY) {
+		log_i("daily clip cap reached (%d in 24 h)", VIDEO_MAX_CLIPS_PER_DAY);
+		rtc_ep.video_done = true;
+		return;
+	}
+#if VIDEO_REQUIRE_PERSON
+	if (rtc_ep.person != EP_PERSON_YES) {
+		if (judged && by_edge) {
+			// The edge that proved motion brought its own photo, judged a
+			// moment ago: that was the fresh check. A photo from an earlier
+			// edge was not taken at T and does not count.
+			rtc_ep.fresh_checked = true;
+		}
+		if (!rtc_ep.fresh_checked) {
+			fresh_check();
+		}
+		if (rtc_ep.person != EP_PERSON_YES) {
+			log_i("no person confirmed this visit; no clip");
+			rtc_ep.video_done = true;
+			return;
+		}
+	}
+#else
+	(void)judged;
+#endif
+	video_run();
+#else
+	(void)edge;
+	(void)judged;
+#endif
+}
+
+// The episode time at which D1 still high proves motion, for the sleep timer.
+static uint64_t video_proof_ms()
+{
+	return rtc_ep.start_ms + (uint64_t)(VIDEO_PRESENCE_MIN_S + PIR_HOLD_S) * 1000u;
 }
 
 // Seconds until `deadline_ms`, at least 1 (a 0 timer would mean none).
@@ -1505,7 +1890,8 @@ static uint32_t min_timer(uint32_t a, uint32_t b)
 
 // Sleep until whatever the current state is waiting for. Never returns.
 //   backoff:           the timer alone, PIR unarmed
-//   episode, D1 high:  D1 falling
+//   episode, D1 high:  D1 falling, or the moment D1 still high would prove
+//                      motion for the video gate
 //   episode, D1 low:   D1 rising (a retrigger), or the gap running out
 //   otherwise:         enter_deep_sleep(), the idle sleep
 // The telemetry timer is folded into every one of them. If D1 has already
@@ -1523,7 +1909,11 @@ static uint32_t min_timer(uint32_t a, uint32_t b)
 	if (rtc_ep.open) {
 		park_for_sleep();
 		if (rtc_ep.d1_high) {
-			deep_sleep_now(0, report_in_s);
+			uint32_t t = report_in_s;
+			if (VIDEO_ENABLED && !rtc_ep.video_done && video_proof_ms() > now_ms()) {
+				t = min_timer(secs_until(video_proof_ms()), t);
+			}
+			deep_sleep_now(0, t);
 		}
 		const uint32_t gap = secs_until(rtc_ep.fall_ms + PRESENCE_GAP_S * 1000u);
 		deep_sleep_now(1, min_timer(gap, report_in_s));
@@ -1531,14 +1921,16 @@ static uint32_t min_timer(uint32_t a, uint32_t b)
 	enter_deep_sleep();
 }
 
-// A wake inside an open episode: follow D1, and handle a retrigger.
-static void episode_event(bool d1, uint32_t t_ref_ms)
+// A wake inside an open episode: follow D1, and handle a retrigger. *edge
+// and *judged report a rising edge now and whether its photo was judged.
+static void episode_event(bool d1, uint32_t t_ref_ms, bool *edge, bool *judged)
 {
 	if (d1 && !rtc_ep.d1_high) {
 		rtc_ep.d1_high = true;
 		log_i("retrigger %lu s into the episode",
 		      (unsigned long)((now_ms() - rtc_ep.start_ms) / 1000));
-		handle_trigger(t_ref_ms);
+		*edge   = true;
+		*judged = handle_trigger(t_ref_ms);
 	} else if (!d1 && rtc_ep.d1_high) {
 		rtc_ep.d1_high = false;
 		rtc_ep.fall_ms = now_ms();
@@ -1681,9 +2073,18 @@ static_assert(framesize_pixels(CAM_FRAMESIZE) != 0,
                               TELEGRAM_STALL_MS / 1000)
 // The driver's JPEG buffer (cam_hal.c, FRAME_SIZE_AUTO) bounds a still.
 #define STILL_MAX_BYTES   (framesize_pixels(CAM_FRAMESIZE) / 5 + TG_MULTIPART_MAX)
+// One association, both phases, worst case.
+#define WIFI_UP_MAX_S     ((WIFI_CONNECT_TIMEOUT_MS + WIFI_DHCP_TIMEOUT_MS) / 1000 + \
+                           2 * DNS_LOOKUP_MAX_S)
+#define CLIP_MAX_BYTES    (VIDEO_MAX_BYTES + TG_MULTIPART_MAX)
+static_assert(framesize_pixels(VIDEO_FRAMESIZE) != 0 &&
+              framesize_pixels(VIDEO_FRAMESIZE) <= 1280u * 720u,
+              "VIDEO_FRAMESIZE must be HD or smaller (config.h)");
 static_assert(WAKE_DEADLINE_S > PIR_IDLE_MAX_S +
-                                (WIFI_CONNECT_TIMEOUT_MS + WIFI_DHCP_TIMEOUT_MS) / 1000 +
-                                2 * DNS_LOOKUP_MAX_S + TG_POST_MAX_S(STILL_MAX_BYTES),
+                                2 * (WIFI_UP_MAX_S + TG_POST_MAX_S(STILL_MAX_BYTES)) +
+                                VIDEO_MAX_CLIPS_PER_EPISODE *
+                                    (VIDEO_MAX_CLIP_S + WIFI_UP_MAX_S +
+                                     TG_POST_MAX_S(CLIP_MAX_BYTES)),
               "WAKE_DEADLINE_S no longer covers the longest normal wake (config.h)");
 
 // Never stopped: every path after setup() arms it ends in deep sleep, which
@@ -1761,6 +2162,7 @@ void setup()
 
 	if (!rtc_initialised) {
 		memset(rtc_bssid, 0, sizeof(rtc_bssid));
+		memset(rtc_clip_times, 0xFF, sizeof(rtc_clip_times));   // CLIP_SLOT_EMPTY
 		rtc_initialised = true;
 		log_i("cold boot");
 	}
@@ -1820,6 +2222,7 @@ void setup()
 	// sleep_for_state() armed. The capture, when there is one, is still the
 	// first slow thing to happen (9.1).
 	const bool d1 = gpio_get_level(PIN_PIR) == 1;
+	bool edge = false, judged = false;
 
 	if (rtc_backoff) {
 		if ((int32_t)(now_s() - rtc_backoff_end_s) < 0) {
@@ -1832,15 +2235,22 @@ void setup()
 			// Still high: exactly what the armed ext0 wake would fire on at
 			// once, so take it as the trigger now.
 			episode_open();
-			handle_trigger(t_setup);
+			judged = handle_trigger(t_setup);
 		}
 	} else if (rtc_ep.open) {
-		episode_event(d1, t_setup);
+		episode_event(d1, t_setup, &edge, &judged);
 	} else if (cause == ESP_SLEEP_WAKEUP_EXT0) {
 		episode_open();
-		handle_trigger(t_setup);
+		judged = handle_trigger(t_setup);
 	}
 	// Anything else is the telemetry timer with nothing going on.
+
+	// After the trigger, never before it: an upload in progress finishes and
+	// detection has run by the time a clip can start.
+	video_check(edge, judged);
+	if (!rtc_backoff && rtc_wind_streak >= WIND_STREAK_BACKOFF) {
+		backoff_start();   // the fresh check can end a streak too
+	}
 
 	maybe_send_telemetry_only();
 	sleep_for_state();

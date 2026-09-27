@@ -247,6 +247,88 @@
 #define DETECT_DECODE_MAX_W    800
 
 // ---------------------------------------------------------------------------
+// Presence video
+//
+// A clip is recorded when the PIR shows presence for VIDEO_PRESENCE_MIN_S or
+// longer and, with VIDEO_REQUIRE_PERSON, the detector has confirmed a person
+// during the episode. The camera and the radio are never on together (9.1
+// step 5, 10): record with the radio off, camera off, then send.
+//
+// The 10-second rule is about motion, not the episode's age. The AM312 holds
+// D1 high for PIR_HOLD_S after the last motion, so a 1 s walk-by alone keeps
+// it high for PIR_HOLD_S; an age check would film everyone who passes. Motion
+// is proven at episode time T >= VIDEO_PRESENCE_MIN_S by a rising edge at T,
+// or by D1 still high at T + PIR_HOLD_S. With continuous motion there are no
+// new edges, so the earliest clip starts about VIDEO_PRESENCE_MIN_S +
+// PIR_HOLD_S after arrival, plus camera init: ~21 s with a 10 s hold, ~13 s
+// with a 2 s one. A visitor who leaves before then is in the photos only.
+//
+// The person gate (VIDEO_REQUIRE_PERSON) keeps a branch in steady wind, which
+// can hold D1 high for minutes, from being filmed. If a photo earlier in the
+// episode held a person, the clip starts at once. If not, one fresh still is
+// taken and judged, at most once per episode: a person there is sent as a
+// photo (it counts toward PHOTOS_PER_EPISODE) and then the clip starts; no
+// person means no clip this episode. A trigger photo taken at the very moment
+// motion is proven serves as that fresh check. bench-nodetect has no detector
+// and records on the 10-second rule alone.
+//
+// Recording stops at the first of: D1 low for VIDEO_END_QUIET_S, the clip
+// reaching VIDEO_MAX_CLIP_S, or the buffer filling. If it stopped on a cap
+// and D1 is still high once the clip is sent, another is recorded, up to
+// VIDEO_MAX_CLIPS_PER_EPISODE; a clip that fails to send ends clips for the
+// episode, since the next would be dropped too. PIR edges during recording
+// are the same visitor: they keep the clip going but are not triggers, and no
+// still is taken for them.
+//
+// The file is MJPEG in AVI (src/avi.cpp), built in one PSRAM buffer of
+// min(VIDEO_MAX_BYTES, largest free block - VIDEO_PSRAM_RESERVE), and sent
+// with sendDocument as clip.avi, video/x-msvideo. sendVideo wants MP4/H.264,
+// which is not worth encoding on the S3.
+//
+// Buffer against time: SVGA JPEGs at VIDEO_JPEG_QUALITY 14 run ~35-75 kB, so
+// at 8 fps 4 MB lasts ~7-15 s. Most clips will end on "buffer full" and the
+// long-visit rule chains the next. Lower VIDEO_FPS or VIDEO_FRAMESIZE VGA
+// stretch it.
+//
+// Energy per clip, from the ~250 mA active figure in 7 (bench to confirm):
+//   camera init and warm-up, ~1 s                          ~0.07 mAh
+//   recording, up to VIDEO_MAX_CLIP_S                      ~2.1 mAh at 30 s
+//   association, TLS, a 4 MB upload at ~200 kB/s (~24 s)   ~1.7 mAh
+//   total                                                  ~3.9 mAh
+// At the TELEGRAM_MIN_BPS floor the upload alone is ~18 mAh. The daily cap
+// is what bounds this: VIDEO_MAX_CLIPS_PER_DAY 6 is ~23 mAh on a day that
+// reaches it, 2.6 times 7's whole ~9 mAh/day budget (8.2 of which is sleep).
+// A node that hit the cap every day would last ~3.5 months, not ~a year.
+// ---------------------------------------------------------------------------
+#define VIDEO_ENABLED                1
+#define VIDEO_PRESENCE_MIN_S         10
+#define VIDEO_REQUIRE_PERSON         1
+// Never above HD, the usual limit for M-JPEG playback on phones; main.cpp
+// checks it.
+#define VIDEO_FRAMESIZE              FRAMESIZE_SVGA
+#define VIDEO_FPS                    8
+#define VIDEO_JPEG_QUALITY           14
+// Short: a clip wants to start, and a clip's first frames going slightly off
+// in colour cost less than the moment they would miss.
+#define VIDEO_WARMUP_MS              300
+#define VIDEO_END_QUIET_S            10
+#define VIDEO_MAX_CLIP_S             30
+#define VIDEO_MAX_BYTES              (4 * 1024 * 1024)
+// Left free beside the clip buffer for the send that follows: TLS, lwIP and
+// the WiFi driver allocate some of theirs in PSRAM in the detect builds
+// (CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP).
+#define VIDEO_PSRAM_RESERVE          (512 * 1024)
+#define VIDEO_MAX_CLIPS_PER_EPISODE  3
+// In any rolling 24 hours, by now_s(); counted when a clip starts recording.
+#define VIDEO_MAX_CLIPS_PER_DAY      6
+
+// bench-nodetect has no detector to confirm a person with.
+#if !DETECTION_ENABLED
+#undef  VIDEO_REQUIRE_PERSON
+#define VIDEO_REQUIRE_PERSON         0
+#endif
+
+// ---------------------------------------------------------------------------
 // WiFi — PROJECT_BRIEF.md 9.4: static IP and a cached BSSID/channel, so the
 // common wake skips both the scan and the DHCP exchange.
 //
@@ -437,17 +519,23 @@
 // then back to sleep without the radio. Deployment mode is attended and never
 // sleeps, so it is never on the clock.
 //
-// This has to sit above the longest wake that is slow but not hung. A wake
-// now handles one PIR event: at most one capture, one detection and one
-// upload, a photo or else a telemetry report. Every term is a timeout or a
-// cap in the code:
+// This has to sit above the longest wake that is slow but not hung. That is
+// a presence-video wake: a trigger photo, the video gate's fresh still, then
+// VIDEO_MAX_CLIPS_PER_EPISODE clips, each recorded and sent before the next.
+// Every term is a timeout or a cap in the code:
 //
-//      30 s  PIR_IDLE_MAX_S       D1 waited out before the idle sleep (main.cpp)
-//   +  12 s  WIFI_CONNECT_TIMEOUT_MS + WIFI_DHCP_TIMEOUT_MS
-//   +  42 s  2 x DNS lookup       wifi_reachable() on the static address,
-//                                 then on the DHCP lease
-//   +  98 s  one tg_post() of a still
-//   = 182 s
+//       30 s  PIR_IDLE_MAX_S       D1 waited out before the idle sleep
+//                                  (main.cpp)
+//   +  304 s  2 x (54 + 98 s)      two stills: an association and a
+//                                  tg_post() each
+//   + 1314 s  3 x (30 + 54 + 354)  the clips: VIDEO_MAX_CLIP_S of recording,
+//                                  an association and a tg_post() of
+//                                  VIDEO_MAX_BYTES each
+//   = 1648 s
+//
+// An association is at most 54 s: WIFI_CONNECT_TIMEOUT_MS +
+// WIFI_DHCP_TIMEOUT_MS, and a DNS lookup in wifi_reachable() on the static
+// address and again on the DHCP lease.
 //
 // A DNS lookup ends only when lwIP gives up: four tries per configured
 // server, 1, 1, 2 and 3 s apart, for up to CONFIG_LWIP_DNS_MAX_SERVERS (3)
@@ -463,15 +551,19 @@
 // For a still, B is the driver's frame buffer at CAM_FRAMESIZE (w x h / 5; a
 // bigger frame never reaches PSRAM) plus 1.5 kB of multipart head and tail.
 // At SVGA that is 97.5 kB, 7 s at the floor rate: 46 + 30 + 7 + 15 = 98 s.
+// For a clip, B is VIDEO_MAX_BYTES plus the same, 263 s at the floor rate for
+// 4 MB: 46 + 30 + 263 + 15 = 354 s.
 //
-// 10 minutes leaves 418 s for what no single timeout bounds: the capture,
-// ~10 s at worst (init, CAM_WARMUP_MS, and two 4 s fb_get() timeouts when a
-// frame overflows its buffer), and one detection, seconds. main.cpp checks
-// the sum at compile time, so retuning a term past this fails the build
-// instead of cutting slow wakes short. A hang that runs the full 10 minutes
-// with the radio up costs something like 15 mAh, a couple of days of the 7
-// budget, rather than the cell.
-#define WAKE_DEADLINE_S          (10 * 60)
+// 32 minutes leaves 272 s for what no single timeout bounds: two captures,
+// ~10 s each at worst (init, CAM_WARMUP_MS, and two 4 s fb_get() timeouts when
+// a frame overflows its buffer), two detections of seconds each, and three
+// video bring-ups of about a second. main.cpp checks the sum at compile time,
+// so retuning a term past this fails the build instead of cutting slow wakes
+// short. It stays one deadline for the whole wake: under 45 minutes,
+// re-arming it per phase buys too little to be worth the complication. A hang
+// that runs the full 32 minutes with the radio up costs something like
+// 50 mAh, most of a week of the 7 budget, rather than the cell.
+#define WAKE_DEADLINE_S          (32 * 60)
 
 // ---------------------------------------------------------------------------
 // Deployment mode — held-BOOT-button setup/aiming interface.
