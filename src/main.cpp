@@ -274,7 +274,17 @@ bool camera_up()
 	cfg.pixel_format = PIXFORMAT_JPEG;
 	cfg.frame_size   = CAM_FRAMESIZE;
 	cfg.jpeg_quality = CAM_JPEG_QUALITY;
-	cfg.fb_count     = 1;
+	// Two buffers, not one, so a discarded warm-up frame does not also cost
+	// the frame after it. In the installed cam_hal.c a JPEG frame ends at the
+	// VSYNC that starts the next one; cam_task() then queues it and looks for
+	// a free buffer to start on. With fb_count = 1 there is none, because the
+	// only one is sitting in the queue, so that next frame is skipped and
+	// capture resumes only at the VSYNC after esp_camera_fb_return(): every
+	// fb_get() after a return waits two frame times. With two buffers and
+	// GRAB_LATEST (a one-deep queue whose newest frame replaces the older)
+	// the sensor streams back to back and fb_get() hands over the latest
+	// finished frame. The second buffer costs one more w x h / 5 of PSRAM.
+	cfg.fb_count     = 2;
 	cfg.fb_location  = CAMERA_FB_IN_PSRAM;
 	cfg.grab_mode    = CAMERA_GRAB_LATEST;
 
@@ -297,23 +307,50 @@ void camera_down()
 	camera_power_off();
 }
 
+// When the frame started, on the millis() clock. cam_hal.c stamps each buffer
+// with esp_timer_get_time() at the VSYNC it starts on, and millis() reads the
+// same timer.
+static uint32_t fb_start_ms(const camera_fb_t *fb)
+{
+	return (uint32_t)(fb->timestamp.tv_sec * 1000 + fb->timestamp.tv_usec / 1000);
+}
+
 // Capture one JPEG into PSRAM and cut camera power before returning (9.1
 // step 5 — the camera must be off before anything slow happens).
-static bool capture(frame_t *out)
+//
+// `t_ref_ms` is the millis() the wake-to-shutter log counts from: setup()
+// entry for the wake's own trigger, the light-sleep wake for a burst trigger.
+static bool capture(frame_t *out, uint32_t t_ref_ms)
 {
 	if (!camera_up()) {
 		return false;
 	}
 
-	for (int i = 0; i < CAM_WARMUP_FRAMES; i++) {
-		camera_fb_t *warm = esp_camera_fb_get();
-		if (warm) {
-			esp_camera_fb_return(warm);
+	// Timed warm-up (config.h). The test is on each frame's start, not on
+	// when fb_get() returned it: with GRAB_LATEST the frame handed over can
+	// have begun a frame time earlier, and it is the exposure that has to
+	// fall after the deadline. Signed, because the first frames can start
+	// before t_init: streaming begins inside esp_camera_init().
+	const uint32_t t_init = millis();
+	int discarded = 0;
+	camera_fb_t *fb;
+	while ((fb = esp_camera_fb_get()) != nullptr) {
+		if (discarded >= CAM_WARMUP_MIN_FRAMES &&
+		    (int32_t)(fb_start_ms(fb) - t_init) >= CAM_WARMUP_MS) {
+			break;
 		}
+		esp_camera_fb_return(fb);
+		discarded++;
+	}
+	if (fb) {
+		log_i("wake-to-shutter %lu ms (frame start; %d warm-up frames over "
+		      "%lu ms)", (unsigned long)(fb_start_ms(fb) - t_ref_ms), discarded,
+		      (unsigned long)(fb_start_ms(fb) - t_init));
+	} else {
+		log_e("fb_get failed after %d warm-up frames", discarded);
 	}
 
 	bool ok = false;
-	camera_fb_t *fb = esp_camera_fb_get();
 	if (fb && fb->len > 0) {
 		uint8_t *copy = (uint8_t *)heap_caps_malloc(fb->len, MALLOC_CAP_SPIRAM);
 		if (copy) {
@@ -1082,6 +1119,7 @@ static void run_burst()
 		esp_sleep_enable_timer_wakeup((uint64_t)BURST_SETTLE * 1000000ULL);
 
 		esp_err_t serr = esp_light_sleep_start();
+		const uint32_t t_edge = millis();   // wake-to-shutter counts from here
 		rtc_gpio_deinit(PIN_PIR);   // back to digital; see wait_for_pir_idle()
 		esp_sleep_wakeup_cause_t wcause = esp_sleep_get_wakeup_cause();
 
@@ -1103,7 +1141,7 @@ static void run_burst()
 
 		record_trigger(now_s());
 		frame_t f;
-		if (capture(&f)) {
+		if (capture(&f, t_edge)) {
 			buffer_push(f);
 		}
 		log_i("burst trigger, %d frames buffered", g_burst_n);
@@ -1241,6 +1279,9 @@ static void wake_deadline_arm()
 // ---------------------------------------------------------------------------
 void setup()
 {
+	// First thing, so wake-to-shutter (capture()) covers everything this
+	// firmware does before the frame, Serial included.
+	const uint32_t t_setup = millis();
 	Serial.begin(115200);
 
 	// Camera off first, before anything else can take time (5: off is the
@@ -1357,7 +1398,7 @@ void setup()
 	// trade the photograph for the transport that carries it. The radio starts
 	// below, once the frame is safe in PSRAM.
 	frame_t f;
-	if (!capture(&f)) {
+	if (!capture(&f, t_setup)) {
 		log_e("capture failed");
 		enter_deep_sleep();
 	}

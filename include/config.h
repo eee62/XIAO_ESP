@@ -50,10 +50,24 @@
 // SGM2036S LDO settle + OV5640 power-on sequence before SCCB will answer.
 #define CAM_LDO_SETTLE_MS    50
 
-// OV5640 AEC/AGC needs a couple of frames to converge after a cold start.
-// Every wake is a cold start (PROJECT_BRIEF.md 9.1 step 3), so the first frame
-// off the sensor is usually mis-exposed. Costs ~2 frame times of camera-on.
-#define CAM_WARMUP_FRAMES    2
+// Exposure and white-balance warm-up. The rail is cut between captures (5), so
+// every wake is a cold sensor (9.1 step 3): AEC/AGC and AWB start from the
+// register defaults, and the first frames are mis-exposed and off-colour.
+//
+// Timed, not counted. Convergence takes wall-clock time, and a fixed frame
+// count means less at high resolution, where each frame takes longer. So
+// frames are discarded until one *starts* at least CAM_WARMUP_MS after init
+// and at least CAM_WARMUP_MIN_FRAMES have been thrown away. Both are bench
+// starting points; deployment mode's cold-capture test reports the resulting
+// wake-to-shutter time. Costs CAM_WARMUP_MS of camera-on per capture: at the
+// ~250 mA active figure in 7, 800 ms is ~0.06 mAh.
+//
+// There is no early exit on "AEC settled". The installed ov5640.c only ever
+// writes the stable-range limits (0x3A0F/10/1B/1E, set_ae_level()); nothing
+// in it reads a converged flag back, and no status register for one could be
+// confirmed from the sources here, so none is guessed at.
+#define CAM_WARMUP_MS          800
+#define CAM_WARMUP_MIN_FRAMES  3
 
 // ---------------------------------------------------------------------------
 // Camera
