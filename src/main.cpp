@@ -1338,9 +1338,11 @@ static void park_for_sleep()
 }
 
 // Arm the given wake sources and deep-sleep. `ext0_level` is the D1 level to
-// wake on, or -1 for none; `timer_s` 0 means no timer. Shared by
-// enter_deep_sleep() and the trigger flow's own sleeps (sleep_for_state()).
-[[noreturn]] static void deep_sleep_now(int ext0_level, uint32_t timer_s)
+// wake on, or -1 for none; `timer_ms` 0 means no timer. Milliseconds, so the
+// video proof point (VIDEO_PRESENCE_MIN_S + PIR_HOLD_S, 12.5 s) is not
+// rounded up to a whole second. Shared by enter_deep_sleep() and the trigger
+// flow's own sleeps (sleep_for_state()).
+[[noreturn]] static void deep_sleep_now(int ext0_level, uint32_t timer_ms)
 {
 	// ext0 switches the pad to its RTC function, so its pulls must be set
 	// through the RTC IO registers to survive deep sleep. Same rule as the
@@ -1356,13 +1358,13 @@ static void park_for_sleep()
 	if (ext0_level >= 0) {
 		esp_sleep_enable_ext0_wakeup(PIN_PIR, ext0_level);
 	}
-	if (timer_s > 0) {
-		esp_sleep_enable_timer_wakeup((uint64_t)timer_s * 1000000ULL);
+	if (timer_ms > 0) {
+		esp_sleep_enable_timer_wakeup((uint64_t)timer_ms * 1000ULL);
 	}
-	log_i("sleeping: wake on D1 %s%s, timer %lu s",
+	log_i("sleeping: wake on D1 %s%s, timer %.1f s",
 	      ext0_level < 0 ? "never" : ext0_level ? "high" : "low",
 	      rtc_ep.open ? " (episode open)" : rtc_backoff ? " (wind backoff)" : "",
-	      (unsigned long)timer_s);
+	      timer_ms / 1000.0f);
 
 	// Holds every digital-only pad (IO26-48) as it is now for the whole
 	// sleep, which keeps the camera pins parked by camera_pins_quiesce().
@@ -1401,7 +1403,7 @@ static void park_for_sleep()
 	log_i("%lu triggers total, %lu photos sent, %lu suppressed",
 	      (unsigned long)rtc_triggers_total, (unsigned long)rtc_photos_sent_total,
 	      (unsigned long)rtc_suppressed_total);
-	deep_sleep_now(1, report_in_s);   // AM312 is active-high (9.1)
+	deep_sleep_now(1, report_in_s * 1000u);   // AM312 is active-high (9.1)
 }
 
 // ---------------------------------------------------------------------------
@@ -1544,6 +1546,11 @@ static bool handle_trigger(uint32_t t_ref_ms)
 // ---------------------------------------------------------------------------
 // Presence video (config.h)
 // ---------------------------------------------------------------------------
+// PIR_HOLD_S may be fractional (2.5); everything below works in ms.
+static_assert(PIR_HOLD_S > 0, "PIR_HOLD_S must be positive (config.h)");
+#define PIR_HOLD_MS  ((uint32_t)(PIR_HOLD_S * 1000.0 + 0.5))
+#define VIDEO_PROOF_MS ((uint64_t)VIDEO_PRESENCE_MIN_S * 1000u + PIR_HOLD_MS)
+
 enum clip_end_t { CLIP_END_QUIET = 0, CLIP_END_TIME, CLIP_END_FULL, CLIP_END_CAMERA };
 static const char *const CLIP_END_NAMES[] = {
 	"PIR quiet", "time cap", "buffer full", "camera error",
@@ -1835,7 +1842,7 @@ static void video_check(bool edge, bool judged)
 	const uint64_t age = now_ms() - rtc_ep.start_ms;
 	const bool     d1  = gpio_get_level(PIN_PIR) == 1;
 	const bool by_edge = edge && age >= (uint64_t)VIDEO_PRESENCE_MIN_S * 1000u;
-	const bool by_hold = d1 && age >= (uint64_t)(VIDEO_PRESENCE_MIN_S + PIR_HOLD_S) * 1000u;
+	const bool by_hold = d1 && age >= VIDEO_PROOF_MS;
 	if (!by_edge && !by_hold) {
 		return;
 	}
@@ -1893,14 +1900,16 @@ void deploy_test_clip(test_clip_t *out)
 // The episode time at which D1 still high proves motion, for the sleep timer.
 static uint64_t video_proof_ms()
 {
-	return rtc_ep.start_ms + (uint64_t)(VIDEO_PRESENCE_MIN_S + PIR_HOLD_S) * 1000u;
+	return rtc_ep.start_ms + VIDEO_PROOF_MS;
 }
 
-// Seconds until `deadline_ms`, at least 1 (a 0 timer would mean none).
-static uint32_t secs_until(uint64_t deadline_ms)
+// Milliseconds until `deadline_ms`, at least 50 (a 0 timer would mean none).
+// The RTC slow clock can run a little fast over a sleep; a wake that lands
+// early finds the deadline not yet reached and sleeps this last bit again.
+static uint32_t ms_until(uint64_t deadline_ms)
 {
 	const uint64_t t = now_ms();
-	return deadline_ms > t + 1000 ? (uint32_t)((deadline_ms - t + 999) / 1000) : 1;
+	return deadline_ms > t + 50 ? (uint32_t)(deadline_ms - t) : 50;
 }
 
 static uint32_t min_timer(uint32_t a, uint32_t b)
@@ -1919,24 +1928,24 @@ static uint32_t min_timer(uint32_t a, uint32_t b)
 // wake handles the edge: nothing is lost, it just costs a boot.
 [[noreturn]] static void sleep_for_state()
 {
-	const uint32_t report_in_s = telegram_configured() ? telemetry_wake_in_s() : 0;
+	const uint32_t report_ms = telegram_configured() ? telemetry_wake_in_s() * 1000u : 0;
 	if (rtc_backoff) {
 		park_for_sleep();
 		const uint32_t left = (int32_t)(rtc_backoff_end_s - now_s()) > 0
 		                          ? rtc_backoff_end_s - now_s() : 1;
-		deep_sleep_now(-1, min_timer(left, report_in_s));
+		deep_sleep_now(-1, min_timer(left * 1000u, report_ms));
 	}
 	if (rtc_ep.open) {
 		park_for_sleep();
 		if (rtc_ep.d1_high) {
-			uint32_t t = report_in_s;
+			uint32_t t = report_ms;
 			if (VIDEO_ENABLED && !rtc_ep.video_done && video_proof_ms() > now_ms()) {
-				t = min_timer(secs_until(video_proof_ms()), t);
+				t = min_timer(ms_until(video_proof_ms()), t);
 			}
 			deep_sleep_now(0, t);
 		}
-		const uint32_t gap = secs_until(rtc_ep.fall_ms + PRESENCE_GAP_S * 1000u);
-		deep_sleep_now(1, min_timer(gap, report_in_s));
+		const uint32_t gap = ms_until(rtc_ep.fall_ms + PRESENCE_GAP_S * 1000u);
+		deep_sleep_now(1, min_timer(gap, report_ms));
 	}
 	enter_deep_sleep();
 }

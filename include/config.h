@@ -215,11 +215,15 @@
 // closes once D1 has been low that long. Kept in RTC memory.
 #define PRESENCE_GAP_S         8
 
-// AM312 hold time: how long D1 stays high after the last motion. Not yet
-// measured on this module. The brief says ~10 s, many AM312 listings ~2 s.
-// Measure it with deployment mode's PIR indicator (wave once, time the light)
-// and set it here: it decides how late a presence clip can start.
-#define PIR_HOLD_S             10
+// AM312 hold time: how long D1 stays high after the last motion, in seconds
+// (fractions allowed). 2.5 s is an estimate for a typical AM312, whose hold
+// is fixed by the module at around 2-3 s and cannot be adjusted, unlike the
+// potentiometer PIR boards that the brief's ~10 s figure fits. It is NOT a
+// measurement of this unit. To measure it: deployment mode's PIR card shows
+// how long D1 was last high; wave once, briefly, and that is the hold time
+// plus the wave. Set it here; nothing else needs to change. It decides how
+// late a presence clip can start (VIDEO_PRESENCE_MIN_S + PIR_HOLD_S).
+#define PIR_HOLD_S             2.5
 
 // Wind backoff. A branch in wind retriggers the PIR all day and never holds
 // a person. After WIND_STREAK_BACKOFF photos in a row judged "no person", the
@@ -287,8 +291,12 @@
 // is proven at episode time T >= VIDEO_PRESENCE_MIN_S by a rising edge at T,
 // or by D1 still high at T + PIR_HOLD_S. With continuous motion there are no
 // new edges, so the earliest clip starts about VIDEO_PRESENCE_MIN_S +
-// PIR_HOLD_S after arrival, plus camera init: ~21 s with a 10 s hold, ~13 s
-// with a 2 s one. A visitor who leaves before then is in the photos only.
+// PIR_HOLD_S after arrival, plus a boot and camera init: at 2.5 s, motion is
+// proven at 12.5 s and the first frame is ~13.6 s in (~0.25 s boot, ~0.55 s
+// power-up and cold init, VIDEO_WARMUP_MS). A 15 s visit therefore gets a
+// clip, catching its last ~1.4 s and then the VIDEO_END_QUIET_S tail after D1
+// falls at 17.5 s. A visitor who leaves before ~13.6 s is in the photos only.
+// (With the brief's 10 s hold it would be ~21 s, after a 15 s visitor left.)
 //
 // The person gate (VIDEO_REQUIRE_PERSON) keeps a branch in steady wind, which
 // can hold D1 high for minutes, from being filmed. If a photo earlier in the

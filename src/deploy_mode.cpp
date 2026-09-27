@@ -149,10 +149,14 @@ static uint32_t          g_clip_seq     = 0;
 static test_clip_t       g_clip         = {};
 static blob_ref          g_clip_avi;
 
-// PIR walk test.
+// PIR walk test. g_pir_high_ms is how long D1 was high the last time, rise to
+// fall, sampled every SERVICE_TICK_MS: after one brief wave that is the
+// AM312's hold time, the figure config.h's PIR_HOLD_S wants.
 static bool     g_pir_level       = false;
 static uint32_t g_pir_edges       = 0;
 static uint32_t g_pir_last_edge_s = 0;
+static uint32_t g_pir_rise_ms     = 0;
+static uint32_t g_pir_high_ms     = 0;
 
 // Deferred actions requested over HTTP.
 enum { ACTION_NONE = 0, ACTION_ARM, ACTION_REBOOT };
@@ -342,6 +346,7 @@ static String status_json()
 	j += ",\"pir\":";           j += g_pir_level ? 1 : 0;
 	j += ",\"pir_edges\":";     j += g_pir_edges;
 	j += ",\"pir_last\":";      j += g_pir_last_edge_s;
+	j += ",\"pir_high_ms\":";   j += g_pir_high_ms;
 	j += ",\"vbat_mv\":";       j += battery_mv();
 	j += ",\"trig_total\":";    j += s.triggers_total;
 	j += ",\"trig_since\":";    j += s.triggers_since_report;
@@ -371,7 +376,7 @@ static String status_json()
 	j += ",\"persons_only\":";  j += SEND_ONLY_PERSONS && DETECTION_ENABLED ? "true" : "false";
 	j += ",\"per_ep\":";        j += PHOTOS_PER_EPISODE;
 	j += ",\"gap\":";           j += PRESENCE_GAP_S;
-	j += ",\"hold\":";          j += PIR_HOLD_S;
+	j += ",\"hold\":";          j += String((float)PIR_HOLD_S, 1);
 	j += ",\"clips_sent\":";    j += s.clips_sent_total;
 	j += ",\"clips_dropped\":"; j += s.clips_dropped_total;
 	j += ",\"clip_s\":";        j += s.clip_s_total;
@@ -702,7 +707,9 @@ function render(d){
   $('pirtxt').textContent=d.pir?'PIR ACTIVE':'PIR idle';
   $('pirsub').innerHTML=d.pir_edges+' trip'+(d.pir_edges==1?'':'s')+
     ' this session<br>'+(d.pir_edges?('last '+dur(d.uptime-d.pir_last)+' ago'):
-    'walk-test the field of view');
+    'walk-test the field of view')+
+    (d.pir_high_ms?'<br>last high '+(d.pir_high_ms/1000).toFixed(1)+
+    ' s (one brief wave = hold time; PIR_HOLD_S '+d.hold+')':'');
 
   rows=[];
   row('Uptime',dur(d.uptime));
@@ -1293,6 +1300,9 @@ static void service_pir()
 	if (level && !g_pir_level) {
 		g_pir_edges++;
 		g_pir_last_edge_s = now_s();
+		g_pir_rise_ms     = millis();
+	} else if (!level && g_pir_level) {
+		g_pir_high_ms = millis() - g_pir_rise_ms;
 	}
 	g_pir_level = level;
 }
