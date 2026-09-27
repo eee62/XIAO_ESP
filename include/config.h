@@ -150,17 +150,71 @@
 #define CAM_AEC2             0
 
 // ---------------------------------------------------------------------------
-// Burst filter — PROJECT_BRIEF.md 9.2
+// Trigger flow — replaces PROJECT_BRIEF.md 9.2
+//
+// 9.2's isolated/burst rule existed to decide when detection was worth its
+// energy. Detection now runs on every photo, with the radio off, and decides
+// what goes out, so the isolated/burst split, its trigger window and the
+// light-sleep burst buffer are gone. This is a deliberate departure from the
+// brief, which is left as it is.
+//
+// Every PIR trigger captures a still, detection judges it, and the radio
+// comes up only for a photo that is going out. Between PIR events the node is
+// in deep sleep, inside a presence episode as much as outside one.
+//
+// Energy per trigger, from the ~250 mA active figure in 7 (bench to confirm):
+//   ~0.2 s boot, ~0.6 s cold init, CAM_WARMUP_MS, a frame   ~0.12 mAh
+//   detection: model load, a reduced decode, inference      ~0.04 mAh
+//   total for a photo that is judged and dropped            ~0.16-0.2 mAh
+//   sending it: association, TLS, and the upload            +~0.5 mAh at
+//     ~200 kB/s for a 1 MB 5 MP still; ~4.5 mAh at TELEGRAM_MIN_BPS
+// Against 7's ~9 mAh/day (8.2 of it sleep), ten person photos a day are ~7 mAh.
 // ---------------------------------------------------------------------------
-#define BURST_COUNT          3    // N: triggers within BURST_WINDOW to call it a burst
-#define BURST_WINDOW         60   // W seconds
-#define BURST_SETTLE         30   // quiet seconds before running detection
-#define BURST_MAX_FRAMES     8    // PSRAM frames buffered per burst; oldest dropped
-#define TRIGGER_LOG_SIZE     16   // RTC ring of trigger timestamps; >= BURST_COUNT
 
-// Hard ceiling on how long one burst may hold us in light sleep. A genuinely
-// pathological scene (branch in sustained wind) must not pin us there forever.
-#define BURST_MAX_DURATION   600  // seconds
+// 1: only photos the detector scores at DETECT_SCORE_THRESHOLD or above go
+// out, plus any it could not judge (fail open). 0: every photo goes out,
+// which is the only way animals get through: the models find people only.
+// bench-nodetect has no detector and always sends unfiltered.
+#define SEND_ONLY_PERSONS      1
+
+// Sent photos per presence episode, at most. A lingering person keeps
+// retriggering the PIR; the clip covers that. Once an episode has this many,
+// its further triggers are counted ("capped") but not photographed, which
+// saves a capture and a detection each.
+#define PHOTOS_PER_EPISODE     3
+
+// Presence episodes. One opens on a PIR rising edge when none is open, stays
+// open while D1 is high or has been low for less than PRESENCE_GAP_S, and
+// closes once D1 has been low that long. Kept in RTC memory.
+#define PRESENCE_GAP_S         8
+
+// AM312 hold time: how long D1 stays high after the last motion. Not yet
+// measured on this module. The brief says ~10 s, many AM312 listings ~2 s.
+// Measure it with deployment mode's PIR indicator (wave once, time the light)
+// and set it here: it decides how late a presence clip can start.
+#define PIR_HOLD_S             10
+
+// Wind backoff. A branch in wind retriggers the PIR all day and never holds
+// a person. After WIND_STREAK_BACKOFF photos in a row judged "no person", the
+// node stops listening to the PIR for WIND_BACKOFF_MIN_S, doubling after each
+// further such photo up to WIND_BACKOFF_MAX_S, and wakes on the timer alone.
+// When the backoff ends the PIR is armed again; if D1 is still high, that is
+// a trigger at once, so steady wind costs one capture per backoff period.
+// A person photo ends it, and so does WIND_QUIET_RESET_S of listening
+// without a single trigger.
+//
+// What that bounds, at ~0.18 mAh a capture, in wind that never stops:
+//   WIND_BACKOFF_MAX_S   900: 96 captures/day, ~17 mAh/day, 15 min deaf
+//   WIND_BACKOFF_MAX_S  1800: 48 captures/day,  ~9 mAh/day, 30 min deaf
+//   WIND_BACKOFF_MAX_S  3600: 24 captures/day,  ~4 mAh/day, 60 min deaf
+// Deaf means just that: a person who arrives mid-backoff is photographed
+// when it ends, if D1 is still high then. Telemetry reports the time the PIR
+// was ignored rather than inventing trigger counts for it. bench-nodetect has
+// no detector, so no streak, so no backoff.
+#define WIND_STREAK_BACKOFF    3
+#define WIND_BACKOFF_MIN_S     60
+#define WIND_BACKOFF_MAX_S     1800
+#define WIND_QUIET_RESET_S     1800
 
 // ---------------------------------------------------------------------------
 // Detection — PROJECT_BRIEF.md 9.2: "Model choice and the detection-confidence
@@ -261,17 +315,6 @@
 // fails, so a node does not stay on DHCP forever after one bad night — the
 // next full retry tries static again.
 #define WIFI_REMEMBER_DHCP        1
-
-// Start associating *while* detection runs, rather than after it (9.1).
-//
-// Set to 0 for the PROJECT_BRIEF.md 11 step 5 bench measurement: that step is
-// characterising the load switch and the sleep floor, and overlapping the
-// radio with inference changes the peak-current profile enough to muddy it.
-// See section 10 — the 470 uF at the battery input is sized for a TX burst,
-// not for a TX burst on top of esp-dl at 240 MHz.
-#ifndef WIFI_EARLY_START
-#define WIFI_EARLY_START          1
-#endif
 
 // ---------------------------------------------------------------------------
 // Telegram delivery — PROJECT_BRIEF.md 9.6
@@ -394,19 +437,17 @@
 // then back to sleep without the radio. Deployment mode is attended and never
 // sleeps, so it is never on the clock.
 //
-// This has to sit above the longest wake that is slow but not hung: a burst
-// held open to its cap, then delivered in full over the worst uplink that
-// still works. Every term is a timeout or a cap in the code:
+// This has to sit above the longest wake that is slow but not hung. A wake
+// now handles one PIR event: at most one capture, one detection and one
+// upload, a photo or else a telemetry report. Every term is a timeout or a
+// cap in the code:
 //
-//     600 s  BURST_MAX_DURATION   burst held open until the cap
-//   +  30 s  BURST_SETTLE         a last settle sleep, ended by a trigger
-//   +  60 s  2 x PIR_IDLE_MAX_S   PIR held high after that trigger, and again
-//                                 before deep sleep (main.cpp)
+//      30 s  PIR_IDLE_MAX_S       D1 waited out before the idle sleep (main.cpp)
 //   +  12 s  WIFI_CONNECT_TIMEOUT_MS + WIFI_DHCP_TIMEOUT_MS
 //   +  42 s  2 x DNS lookup       wifi_reachable() on the static address,
 //                                 then on the DHCP lease
-//   + 784 s  BURST_MAX_FRAMES x 98 s, one tg_post() per frame
-//   = 1528 s
+//   +  98 s  one tg_post() of a still
+//   = 182 s
 //
 // A DNS lookup ends only when lwIP gives up: four tries per configured
 // server, 1, 1, 2 and 3 s apart, for up to CONFIG_LWIP_DNS_MAX_SERVERS (3)
@@ -423,14 +464,14 @@
 // bigger frame never reaches PSRAM) plus 1.5 kB of multipart head and tail.
 // At SVGA that is 97.5 kB, 7 s at the floor rate: 46 + 30 + 7 + 15 = 98 s.
 //
-// 27 minutes leaves 92 s for what no single timeout bounds: the camera
-// bring-ups outside the burst cap, ~10 s each at worst (init, CAM_WARMUP_MS,
-// and two 4 s fb_get() timeouts when a frame overflows its buffer), and
-// detection over BURST_MAX_FRAMES frames. main.cpp checks the sum at compile
-// time, so retuning a term past this fails the build instead of cutting long
-// bursts short. A hang that runs the full 27 minutes with the radio up costs
-// something like 40 mAh, several days of the 7 budget, rather than the cell.
-#define WAKE_DEADLINE_S          (27 * 60)
+// 10 minutes leaves 418 s for what no single timeout bounds: the capture,
+// ~10 s at worst (init, CAM_WARMUP_MS, and two 4 s fb_get() timeouts when a
+// frame overflows its buffer), and one detection, seconds. main.cpp checks
+// the sum at compile time, so retuning a term past this fails the build
+// instead of cutting slow wakes short. A hang that runs the full 10 minutes
+// with the radio up costs something like 15 mAh, a couple of days of the 7
+// budget, rather than the cell.
+#define WAKE_DEADLINE_S          (10 * 60)
 
 // ---------------------------------------------------------------------------
 // Deployment mode — held-BOOT-button setup/aiming interface.

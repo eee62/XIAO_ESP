@@ -34,6 +34,13 @@ struct deploy_status_t {
 	uint32_t suppressed_since_report;
 	uint32_t detect_errors_total;         // frames detection could not judge
 	uint32_t detect_errors_since_report;
+	uint32_t photos_sent_total;
+	uint32_t photos_sent_since_report;
+	uint32_t photos_dropped_total;
+	uint32_t capped_total;                // triggers over PHOTOS_PER_EPISODE
+	uint8_t  wind_streak;                 // no-person photos in a row
+	uint32_t backoff_left_s;              // 0 unless the PIR is being ignored
+	uint32_t backoff_s_total;             // seconds the PIR has been ignored
 	uint32_t last_report_s;
 	bool     have_ap_cache;
 	uint8_t  ap_channel;

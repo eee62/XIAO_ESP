@@ -1,5 +1,5 @@
-// Wildlife camera node — PIR-triggered capture with burst filtering and
-// on-device human detection.
+// Wildlife camera node — PIR-triggered capture, judged by on-device person
+// detection before anything is sent.
 //
 // Written against PROJECT_BRIEF.md. Section references below point at it.
 //
@@ -11,10 +11,13 @@
 // The capture is first and nothing is allowed in front of it, the radio least
 // of all: bringing up esp_wifi blocks this task for tens of milliseconds, and
 // the subject is walking. Association is started afterwards, once the frame is
-// safe in PSRAM, and then overlaps whatever comes next — see setup().
+// safe in PSRAM and judged — see handle_trigger().
 //
-// Burst filter (9.2): an isolated trigger is sent straight out; a burst is
-// buffered and only sent if detection finds a human once the burst settles.
+// Trigger flow (config.h; replaces 9.2's isolated/burst rule, deliberately):
+// every PIR trigger takes a still, detection judges it with the radio off,
+// and only a photo that is going out brings the radio up. Triggers group
+// into presence episodes, tracked in RTC memory across the deep sleeps
+// between PIR events; a branch in wind is held off by a backoff.
 //
 // Delivery (9.6): frames go to a Telegram chat as multipart/form-data over
 // TLS. There is no local persistence — a frame that does not go out on the
@@ -76,11 +79,8 @@
 // Give up waiting for the AM312 to drop rather than spin forever.
 #define PIR_IDLE_MAX_S 30
 
-// Empty slot marker for the trigger ring. Not 0 — now_s() legitimately returns
+// "Never" for rtc_last_report_attempt_s. Not 0: now_s() legitimately returns
 // 0 during the first second after a cold boot.
-#define TRIGGER_SLOT_EMPTY 0xFFFFFFFFu
-
-// "Never" for rtc_last_report_attempt_s. Not 0, for the same reason.
 #define REPORT_NEVER 0xFFFFFFFFu
 
 // Marks rtc_reset_stats as initialised; anything else in there is garbage.
@@ -90,8 +90,6 @@
 // State that must survive deep sleep — RTC slow memory (9.2).
 // ---------------------------------------------------------------------------
 RTC_DATA_ATTR static bool     rtc_initialised = false;
-RTC_DATA_ATTR static uint32_t rtc_trigger_log[TRIGGER_LOG_SIZE];
-RTC_DATA_ATTR static uint8_t  rtc_trigger_head = 0;
 
 RTC_DATA_ATTR static uint32_t rtc_triggers_total = 0;
 RTC_DATA_ATTR static uint32_t rtc_triggers_since_report = 0;
@@ -99,9 +97,18 @@ RTC_DATA_ATTR static uint32_t rtc_suppressed_since_report = 0;
 RTC_DATA_ATTR static uint32_t rtc_suppressed_total = 0;
 // Frames the detector could not judge (decode or allocation failure). Kept
 // apart from "suppressed", which means judged and found empty: these are sent
-// unfiltered instead (detect_over_buffer()).
+// unfiltered instead (handle_trigger()).
 RTC_DATA_ATTR static uint32_t rtc_detect_errors_total = 0;
 RTC_DATA_ATTR static uint32_t rtc_detect_errors_since_report = 0;
+// Photos delivered, and photos that were going out but could not be.
+RTC_DATA_ATTR static uint32_t rtc_photos_sent_total = 0;
+RTC_DATA_ATTR static uint32_t rtc_photos_sent_since_report = 0;
+RTC_DATA_ATTR static uint32_t rtc_photos_dropped_total = 0;
+RTC_DATA_ATTR static uint32_t rtc_photos_dropped_since_report = 0;
+// Triggers counted but not photographed: their episode already had
+// PHOTOS_PER_EPISODE photos out.
+RTC_DATA_ATTR static uint32_t rtc_capped_total = 0;
+RTC_DATA_ATTR static uint32_t rtc_capped_since_report = 0;
 RTC_DATA_ATTR static uint32_t rtc_last_report_s = 0;
 
 // When a telemetry-carrying transmission was last *attempted*, delivered or
@@ -115,6 +122,36 @@ RTC_DATA_ATTR static uint32_t rtc_last_report_attempt_s = REPORT_NEVER;
 // frame overflows the driver's buffer, then whatever worked (config.h,
 // CAM_QUALITY_STEP).
 RTC_DATA_ATTR static uint8_t  rtc_cam_quality = CAM_JPEG_QUALITY;
+
+// Presence episode (config.h, PRESENCE_GAP_S). The node deep-sleeps between
+// PIR events inside an episode too, so this lives in RTC memory. The
+// ext0 wake is armed for the opposite of d1_high, which is how a wake tells
+// a rising edge from a falling one.
+enum : uint8_t { EP_PERSON_UNCHECKED = 0, EP_PERSON_NO, EP_PERSON_YES };
+struct episode_t {
+	bool     open;
+	bool     d1_high;       // D1 as last seen
+	uint8_t  photos_sent;   // against PHOTOS_PER_EPISODE
+	uint8_t  person;        // EP_PERSON_*: did any photo in it hold a person
+	uint64_t start_ms;      // now_ms() at the edge that opened it
+	uint64_t fall_ms;       // now_ms() when D1 last fell
+};
+RTC_DATA_ATTR static episode_t rtc_ep;
+
+// Wind backoff (config.h). While rtc_backoff is set the PIR is not armed at
+// all and only the timer wakes the node, at rtc_backoff_end_s. rtc_listen_s
+// is the last trigger, or the moment the PIR was armed again after a backoff:
+// WIND_QUIET_RESET_S counts from it.
+RTC_DATA_ATTR static uint8_t  rtc_wind_streak     = 0;
+RTC_DATA_ATTR static uint8_t  rtc_backoff_level   = 0;
+RTC_DATA_ATTR static bool     rtc_backoff         = false;
+RTC_DATA_ATTR static uint32_t rtc_backoff_start_s = 0;
+RTC_DATA_ATTR static uint32_t rtc_backoff_end_s   = 0;
+RTC_DATA_ATTR static uint32_t rtc_listen_s        = 0;
+// Seconds the PIR was ignored, for the report (9.3): the honest stand-in for
+// the triggers that could not be counted meanwhile.
+RTC_DATA_ATTR static uint32_t rtc_backoff_s_total = 0;
+RTC_DATA_ATTR static uint32_t rtc_backoff_s_since_report = 0;
 
 // Cached association parameters (9.4) — skips the scan on every wake.
 RTC_DATA_ATTR static bool     rtc_have_ap = false;
@@ -139,15 +176,9 @@ struct reset_stats_t {
 RTC_NOINIT_ATTR static reset_stats_t rtc_reset_stats;
 
 // ---------------------------------------------------------------------------
-// Burst frame buffer.
-//
-// IMPORTANT: this lives in PSRAM, which loses its contents in deep sleep —
-// esp_deep_sleep_start() powers down VDD_SPI unconditionally. 9.2 says to keep
-// buffering while "sleeping between triggers", so for the duration of a burst
-// only we use LIGHT sleep, which retains RAM and PSRAM. A burst costs roughly
-// BURST_SETTLE seconds at light-sleep current (order 1 mA) instead of ~340 uA;
-// at a few bursts a day that is well under 1% of the 9 mAh/day budget in 7.
-// Everything outside a burst still uses deep sleep.
+// One captured still, in PSRAM. PSRAM loses its contents in deep sleep
+// (esp_deep_sleep_start() powers down VDD_SPI), so a frame lives exactly as
+// long as the wake that took it: it is judged, sent or dropped, and freed.
 // ---------------------------------------------------------------------------
 struct frame_t {
 	uint8_t *data;
@@ -160,16 +191,13 @@ struct frame_t {
 	uint8_t  quality;      // JPEG quality number it was taken at
 };
 
-static frame_t g_burst[BURST_MAX_FRAMES];
-static int     g_burst_n = 0;
-
 // ---------------------------------------------------------------------------
 // Monotonic seconds since first power-on.
 //
 // Deliberately NOT esp_timer_get_time(): that is backed by the high-resolution
 // systimer, which lives in the digital domain and restarts from zero on every
-// deep-sleep wake. BURST_WINDOW has to span deep sleeps, so it needs the RTC
-// timer instead.
+// deep-sleep wake. Episodes and the wind backoff have to span deep sleeps, so
+// they need the RTC timer instead.
 //
 // gettimeofday() is backed by ESP-IDF system time, whose default configuration
 // is "RTC and high-resolution timer": the RTC timer keeps counting through
@@ -178,7 +206,8 @@ static int     g_burst_n = 0;
 // counted from the epoch.
 //
 // A power-on reset (battery swap) zeroes this - and also clears RTC slow
-// memory, so the trigger log resets with it. The two stay consistent.
+// memory, so the episode and backoff state reset with it. The two stay
+// consistent.
 // ---------------------------------------------------------------------------
 uint32_t now_s()
 {
@@ -187,27 +216,21 @@ uint32_t now_s()
 	return (uint32_t)tv.tv_sec;
 }
 
+// The same clock in milliseconds, for episode timing.
+static uint64_t now_ms()
+{
+	struct timeval tv;
+	gettimeofday(&tv, nullptr);
+	return (uint64_t)tv.tv_sec * 1000u + (uint64_t)tv.tv_usec / 1000u;
+}
+
 // ---------------------------------------------------------------------------
 // Trigger bookkeeping
 // ---------------------------------------------------------------------------
-static void record_trigger(uint32_t t)
+static void record_trigger()
 {
-	rtc_trigger_log[rtc_trigger_head] = t;
-	rtc_trigger_head = (rtc_trigger_head + 1) % TRIGGER_LOG_SIZE;
 	rtc_triggers_total++;
 	rtc_triggers_since_report++;
-}
-
-static int triggers_in_window(uint32_t t)
-{
-	int n = 0;
-	for (int i = 0; i < TRIGGER_LOG_SIZE; i++) {
-		uint32_t e = rtc_trigger_log[i];
-		if (e != TRIGGER_SLOT_EMPTY && t >= e && (t - e) <= (uint32_t)BURST_WINDOW) {
-			n++;
-		}
-	}
-	return n;
 }
 
 // ---------------------------------------------------------------------------
@@ -471,30 +494,6 @@ static bool capture(frame_t *out, uint32_t t_ref_ms)
 }
 
 // ---------------------------------------------------------------------------
-// Burst buffer
-// ---------------------------------------------------------------------------
-static void buffer_push(const frame_t &f)
-{
-	if (g_burst_n == BURST_MAX_FRAMES) {
-		// Drop the oldest. A long burst is junk by definition; the frames
-		// nearest the settle point are the ones worth judging.
-		heap_caps_free(g_burst[0].data);
-		memmove(&g_burst[0], &g_burst[1], sizeof(frame_t) * (BURST_MAX_FRAMES - 1));
-		g_burst_n--;
-	}
-	g_burst[g_burst_n++] = f;
-}
-
-static void buffer_clear()
-{
-	for (int i = 0; i < g_burst_n; i++) {
-		heap_caps_free(g_burst[i].data);
-		g_burst[i].data = nullptr;
-	}
-	g_burst_n = 0;
-}
-
-// ---------------------------------------------------------------------------
 // Detection (9.2)
 // ---------------------------------------------------------------------------
 #if DETECTION_ENABLED
@@ -645,91 +644,34 @@ static bool detect_frame(detector_t *det, frame_t &f, uint32_t *dec_ms,
 	return true;
 }
 
-// Returns the number of buffered frames containing a human, and tags each
-// frame with its best score. Frames the detector could not judge are flagged
-// `err` and counted in *errors instead: they are neither hits nor
-// suppressions, and the caller sends them unfiltered.
-//
-// `on_first_hit` is invoked the moment the first frame is known to be going
-// out, a hit or an error, and is how the radio gets started early without
-// being started speculatively. The alternative — associating before
-// detection runs — would light the radio for every burst, and the whole
-// premise of 9.2 is that most bursts are wind in a branch and resolve to
-// nothing. Firing on the first frame out means the association overlaps the
-// remaining frames exactly when there is going to be something to send, and
-// never runs at all on a burst that gets suppressed.
-static int detect_over_buffer(void (*on_first_hit)(), int *errors)
+// Judge one photo, radio off: model load, decode and inference, each timed.
+// Sets f.score and f.hit, or f.err when it could not be judged. Returns false
+// on that error.
+static bool judge_frame(frame_t &f)
 {
-	*errors = 0;
-	if (g_burst_n == 0) {
-		return 0;
-	}
-
 	const uint32_t t0 = millis();
-	uint32_t load_ms = 0;
+	uint32_t load_ms = 0, dec_ms = 0, inf_ms = 0;
 	detector_t *det = detector_open(&load_ms);
 	if (!det) {
-		// Out of memory for the model. Fail open: a frame we could not judge
-		// is better sent than silently dropped.
-		log_e("detector alloc failed, sending burst unfiltered");
-		for (int i = 0; i < g_burst_n; i++) {
-			g_burst[i].err = true;
-		}
-		if (on_first_hit) {
-			on_first_hit();
-		}
-		*errors = g_burst_n;
-		return 0;
+		log_e("detector alloc failed; the photo goes out unjudged");
+		f.err = true;
+		return false;
 	}
-	log_i("%s model loaded in %lu ms", DETECT_MODEL_NAME, (unsigned long)load_ms);
-
-	int hits = 0;
-	for (int i = 0; i < g_burst_n; i++) {
-		frame_t &f = g_burst[i];
-		uint32_t dec_ms, inf_ms;
-		log_i("frame %d:", i);
-		if (!detect_frame(det, f, &dec_ms, &inf_ms)) {
-			// Fail open, as for the model allocation above.
-			log_w("frame %d: jpeg decode failed after %lu ms; sending unjudged",
-			      i, (unsigned long)dec_ms);
-			(*errors)++;
-		} else if (f.hit) {
-			hits++;
-		}
-		if ((f.hit || f.err) && hits + *errors == 1 && on_first_hit) {
-			// This burst is going out. Start the radio now so the handshake
-			// runs against the remaining frames' inference rather than
-			// after it.
-			on_first_hit();
-		}
-	}
-
+	const bool ok = detect_frame(det, f, &dec_ms, &inf_ms);
 	delete det;
-	log_i("%s detection over %d frames: %d hits, %d errors in %lu ms",
-	      DETECT_MODEL_NAME, g_burst_n, hits, *errors,
-	      (unsigned long)(millis() - t0));
-	return hits;
+	log_i("%s: load %lu ms, decode %lu ms, inference %lu ms, %lu ms in all%s",
+	      DETECT_MODEL_NAME, (unsigned long)load_ms, (unsigned long)dec_ms,
+	      (unsigned long)inf_ms, (unsigned long)(millis() - t0),
+	      ok ? "" : " (decode failed)");
+	return ok;
 }
 
 #else  // !DETECTION_ENABLED
 
-// bench-nodetect build (PROJECT_BRIEF.md 11 step 5): no esp-dl linked. Bursts
-// are buffered and discarded so the power profile still matches the real
-// firmware while the load switch is being validated.
-//
-// Nothing ever hits here, so on_first_hit is never called and this build never
-// raises the radio for a burst — which is what keeps the sleep-current
-// measurement that step 5 is after comparable to the real firmware's.
-static int detect_over_buffer(void (*on_first_hit)(), int *errors)
-{
-	(void)on_first_hit;
-	*errors = 0;
-	log_w("detection disabled at compile time; discarding %d buffered frames",
-	      g_burst_n);
-	return 0;
-}
+// bench-nodetect build (PROJECT_BRIEF.md 11 step 5): no esp-dl linked, so no
+// photo is ever judged, and every one goes out unfiltered.
 
-#endif // DETECTION_ENABLED
+#endif // DETECTION_ENABLED#endif // DETECTION_ENABLED
 
 // ---------------------------------------------------------------------------
 // Deployment mode's cold-capture test (deploy_mode.h). The same capture() and
@@ -798,6 +740,14 @@ void deploy_fill_status(deploy_status_t *out)
 	out->suppressed_since_report    = rtc_suppressed_since_report;
 	out->detect_errors_total        = rtc_detect_errors_total;
 	out->detect_errors_since_report = rtc_detect_errors_since_report;
+	out->photos_sent_total          = rtc_photos_sent_total;
+	out->photos_sent_since_report   = rtc_photos_sent_since_report;
+	out->photos_dropped_total       = rtc_photos_dropped_total;
+	out->capped_total               = rtc_capped_total;
+	out->wind_streak                = rtc_wind_streak;
+	out->backoff_left_s             = rtc_backoff && (int32_t)(rtc_backoff_end_s - now_s()) > 0
+	                                      ? rtc_backoff_end_s - now_s() : 0;
+	out->backoff_s_total            = rtc_backoff_s_total;
 	out->last_report_s              = rtc_last_report_s;
 	out->have_ap_cache              = rtc_have_ap;
 	out->using_dhcp                 = rtc_use_dhcp;
@@ -1109,7 +1059,7 @@ static bool wifi_up()
 static String telemetry_text(const char *reason, float score, int idx, int total)
 {
 	String c;
-	c.reserve(256);
+	c.reserve(512);
 
 	// Empty unless secrets.h sets it. A string literal, so this folds away.
 	if (TELEGRAM_CAPTION_PREFIX[0] != '\0') {
@@ -1133,18 +1083,35 @@ static String telemetry_text(const char *reason, float score, int idx, int total
 		c += '\n';
 	}
 
+	// Totals, then (+ since the last report that landed), as 9.3 asks.
 	c += "triggers ";
 	c += rtc_triggers_total;
 	c += " (+";
 	c += rtc_triggers_since_report;
-	c += " since report)\nsuppressed ";
+	c += " since report)\nphotos sent ";
+	c += rtc_photos_sent_total;
+	c += " (+";
+	c += rtc_photos_sent_since_report;
+	c += "), dropped ";
+	c += rtc_photos_dropped_total;
+	c += " (+";
+	c += rtc_photos_dropped_since_report;
+	c += ")\nsuppressed ";
 	c += rtc_suppressed_total;
 	c += " (+";
 	c += rtc_suppressed_since_report;
+	c += "), capped ";
+	c += rtc_capped_total;
+	c += " (+";
+	c += rtc_capped_since_report;
 	c += ")\ndetect errors ";
 	c += rtc_detect_errors_total;
 	c += " (+";
 	c += rtc_detect_errors_since_report;
+	c += ")\nPIR ignored (wind) ";
+	c += rtc_backoff_s_total;
+	c += " s (+";
+	c += rtc_backoff_s_since_report;
 	c += ")\nbattery ";
 
 	const int32_t mv = battery_mv();
@@ -1178,66 +1145,68 @@ static String telemetry_text(const char *reason, float score, int idx, int total
 // what makes maybe_send_telemetry_only() below worth keeping: it is the one
 // mechanism that lets a node with a dead uplink still be noticed as alive.
 // ---------------------------------------------------------------------------
-static bool send_frames(const char *reason, bool only_hits)
+// A report has landed: the since-report counters start again (9.3).
+static void report_landed()
 {
-	// With only_hits, frames detection could not judge go out too (fail
-	// open, detect_over_buffer()).
-	int total = 0;
-	for (int i = 0; i < g_burst_n; i++) {
-		if (!only_hits || g_burst[i].hit || g_burst[i].err) {
-			total++;
-		}
-	}
-	if (total == 0) {
-		return true;
-	}
+	rtc_triggers_since_report       = 0;
+	rtc_suppressed_since_report     = 0;
+	rtc_detect_errors_since_report  = 0;
+	rtc_photos_sent_since_report    = 0;
+	rtc_photos_dropped_since_report = 0;
+	rtc_capped_since_report         = 0;
+	rtc_backoff_s_since_report      = 0;
+	rtc_last_report_s               = now_s();
+}
 
+// Send one photo: radio up, upload, radio down. The camera is already off
+// (9.1 step 5). Counted as sent before the caption is built, so the caption
+// includes it, and taken back if the upload fails.
+static bool send_photo(const frame_t &f, const char *reason)
+{
 	// Credentials before the radio. A node built without secrets.h should go
 	// straight back to sleep, not spend an association proving it cannot send.
 	if (!telegram_configured()) {
 		log_e("no Telegram credentials compiled in (include/secrets.h); "
-		      "dropping %d frame(s)", total);
+		      "photo dropped");
+		rtc_photos_dropped_total++;
+		rtc_photos_dropped_since_report++;
 		return false;
 	}
 
 	rtc_last_report_attempt_s = now_s();   // every caption carries telemetry
-	if (!wifi_up()) {
-		log_w("no uplink; dropping %d frame(s)", total);
-		return false;
-	}
-
-	int sent = 0, idx = 0;
-	for (int i = 0; i < g_burst_n; i++) {
-		if (only_hits && !g_burst[i].hit && !g_burst[i].err) {
-			continue;
+	bool ok = false;
+	if (wifi_up()) {
+		rtc_photos_sent_total++;
+		rtc_photos_sent_since_report++;
+		String why = reason;
+		why += "\nvisit photo ";
+		why += rtc_ep.photos_sent + 1;
+		why += " of at most ";
+		why += PHOTOS_PER_EPISODE;
+		const String cap = telemetry_text(why.c_str(), f.score, 0, 0);
+		ok = telegram_send_photo(f.data, f.len, cap);
+		if (!ok) {
+			rtc_photos_sent_total--;
+			rtc_photos_sent_since_report--;
 		}
-		const int n = ++idx;
-		const String cap = telemetry_text(g_burst[i].err ? "detect_error_unjudged" : reason,
-		                                  g_burst[i].score, n - 1, total);
-		if (telegram_send_photo(g_burst[i].data, g_burst[i].len, cap)) {
-			sent++;
-		} else {
-			log_w("frame %d/%d not delivered, dropped", n, total);
-		}
+	} else {
+		log_w("no uplink");
 	}
 	wifi_down();
 
-	if (sent > 0) {
+	if (ok) {
 		// Counters are cumulative "since last report" (9.3) — clear them only
 		// once a report has actually landed somewhere.
-		rtc_triggers_since_report      = 0;
-		rtc_suppressed_since_report    = 0;
-		rtc_detect_errors_since_report = 0;
-		rtc_last_report_s              = now_s();
+		report_landed();
+	} else {
+		log_w("photo not delivered, dropped");
+		rtc_photos_dropped_total++;
+		rtc_photos_dropped_since_report++;
 	}
-	log_i("sent %d/%d frames", sent, total);
-	return sent == total;
+	return ok;
 }
 
-// Is a bare telemetry report owed right now? Split out of the function below
-// because setup() needs the answer *before* detection runs: when a report is
-// due the node is going to transmit whatever the detector decides, so the
-// radio can be started up front rather than waiting on the first hit.
+// Is a bare telemetry report owed right now?
 static bool telemetry_due()
 {
 	if (!telegram_configured()) {
@@ -1278,10 +1247,7 @@ static void maybe_send_telemetry_only()
 	}
 
 	if (telegram_send_message(telemetry_text("telemetry", 0.0f, 0, 0))) {
-		rtc_triggers_since_report      = 0;
-		rtc_suppressed_since_report    = 0;
-		rtc_detect_errors_since_report = 0;
-		rtc_last_report_s              = now_s();
+		report_landed();
 	}
 	wifi_down();
 }
@@ -1313,11 +1279,9 @@ static void wait_for_pir_idle()
 	}
 }
 
-// Never returns: ends in esp_deep_sleep_start(). Marked so the compiler
-// enforces that no caller falls through into code using stale state.
-[[noreturn]] void enter_deep_sleep()
+// Camera and radio off, as every sleep starts.
+static void park_for_sleep()
 {
-	buffer_clear();
 	camera_power_off();
 	// Normally a repeat of camera_down(). Deployment mode's shutdown can get
 	// here without it: when a stream will not let go of the sensor,
@@ -1327,8 +1291,13 @@ static void wait_for_pir_idle()
 	// whatever state reset left them.
 	camera_pins_quiesce();
 	wifi_down();
-	wait_for_pir_idle();
+}
 
+// Arm the given wake sources and deep-sleep. `ext0_level` is the D1 level to
+// wake on, or -1 for none; `timer_s` 0 means no timer. Shared by
+// enter_deep_sleep() and the trigger flow's own sleeps (sleep_for_state()).
+[[noreturn]] static void deep_sleep_now(int ext0_level, uint32_t timer_s)
+{
 	// ext0 switches the pad to its RTC function, so its pulls must be set
 	// through the RTC IO registers to survive deep sleep. Same rule as the
 	// digital side in setup(): no pulldown unless PIR_INTERNAL_PULLDOWN.
@@ -1340,19 +1309,16 @@ static void wait_for_pir_idle()
 	rtc_gpio_pullup_dis(PIN_PIR);
 
 	esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-	esp_sleep_enable_ext0_wakeup(PIN_PIR, 1);   // AM312 is active-high (9.1)
-
-	// Wake for the periodic report even if nothing moves. Without this a node
-	// that sees no motion never reports, and a quiet node looks the same as a
-	// mute one (9.6). The wake goes through setup()'s non-PIR branch. By
-	// now_s() it can arrive slightly early, because the RC slow clock is
-	// recalibrated between arming and waking. telemetry_due() then says no,
-	// and the floor makes that one more short sleep, not a loop.
-	if (telegram_configured()) {
-		const uint32_t report_in_s = telemetry_wake_in_s();
-		esp_sleep_enable_timer_wakeup((uint64_t)report_in_s * 1000000ULL);
-		log_i("telemetry timer armed for %lu s", (unsigned long)report_in_s);
+	if (ext0_level >= 0) {
+		esp_sleep_enable_ext0_wakeup(PIN_PIR, ext0_level);
 	}
+	if (timer_s > 0) {
+		esp_sleep_enable_timer_wakeup((uint64_t)timer_s * 1000000ULL);
+	}
+	log_i("sleeping: wake on D1 %s%s, timer %lu s",
+	      ext0_level < 0 ? "never" : ext0_level ? "high" : "low",
+	      rtc_ep.open ? " (episode open)" : rtc_backoff ? " (wind backoff)" : "",
+	      (unsigned long)timer_s);
 
 	// Holds every digital-only pad (IO26-48) as it is now for the whole
 	// sleep, which keeps the camera pins parked by camera_pins_quiesce().
@@ -1361,8 +1327,6 @@ static void wait_for_pir_idle()
 	// holds it through deep sleep by itself.
 	gpio_deep_sleep_hold_en();
 
-	log_i("sleeping; %lu triggers total, %lu suppressed",
-	      (unsigned long)rtc_triggers_total, (unsigned long)rtc_suppressed_total);
 	Serial.flush();
 	esp_deep_sleep_start();
 
@@ -1371,54 +1335,217 @@ static void wait_for_pir_idle()
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Burst handling (9.2)
-// ---------------------------------------------------------------------------
-// Stay resident in light sleep, absorbing further triggers, until the scene
-// goes quiet for BURST_SETTLE seconds. Only then is detection worth its energy.
-static void run_burst()
+// Never returns: ends in esp_deep_sleep_start(). Marked so the compiler
+// enforces that no caller falls through into code using stale state.
+//
+// The idle sleep: wake on the next PIR rising edge, or the telemetry timer.
+// Also the exit for abnormal resets and for deployment mode's arm, so it knows
+// nothing of episodes; the trigger flow uses sleep_for_state().
+[[noreturn]] void enter_deep_sleep()
 {
-	const uint32_t burst_start = now_s();
+	park_for_sleep();
+	wait_for_pir_idle();
 
-	while (true) {
-		wait_for_pir_idle();
+	// Wake for the periodic report even if nothing moves. Without this a node
+	// that sees no motion never reports, and a quiet node looks the same as a
+	// mute one (9.6). The wake goes through setup()'s non-PIR branch. By
+	// now_s() it can arrive slightly early, because the RC slow clock is
+	// recalibrated between arming and waking. telemetry_due() then says no,
+	// and the floor makes that one more short sleep, not a loop.
+	const uint32_t report_in_s = telegram_configured() ? telemetry_wake_in_s() : 0;
 
-		if (now_s() - burst_start >= (uint32_t)BURST_MAX_DURATION) {
-			log_w("burst exceeded %d s, forcing settle", BURST_MAX_DURATION);
-			break;
+	log_i("%lu triggers total, %lu photos sent, %lu suppressed",
+	      (unsigned long)rtc_triggers_total, (unsigned long)rtc_photos_sent_total,
+	      (unsigned long)rtc_suppressed_total);
+	deep_sleep_now(1, report_in_s);   // AM312 is active-high (9.1)
+}
+
+// ---------------------------------------------------------------------------
+// Trigger flow (config.h) — replaces 9.2's isolated/burst rule
+// ---------------------------------------------------------------------------
+static void episode_open()
+{
+	memset(&rtc_ep, 0, sizeof(rtc_ep));
+	rtc_ep.open     = true;
+	rtc_ep.d1_high  = true;
+	rtc_ep.start_ms = now_ms();
+	log_i("episode opened");
+}
+
+static void episode_close(const char *why)
+{
+	if (rtc_ep.open) {
+		log_i("episode closed (%s) after %lu s, %u photo(s) sent, person %s", why,
+		      (unsigned long)((now_ms() - rtc_ep.start_ms) / 1000),
+		      rtc_ep.photos_sent,
+		      rtc_ep.person == EP_PERSON_YES ? "yes" :
+		      rtc_ep.person == EP_PERSON_NO  ? "no"  : "not checked");
+	}
+	rtc_ep.open = false;
+}
+
+// The PIR goes deaf for a while (config.h, wind backoff). Closes the episode:
+// with the PIR unarmed there is no following it.
+static void backoff_start()
+{
+	const uint8_t  level = rtc_backoff_level < 16 ? rtc_backoff_level : 16;
+	uint32_t len = (uint32_t)WIND_BACKOFF_MIN_S << level;
+	if (len > (uint32_t)WIND_BACKOFF_MAX_S || len < (uint32_t)WIND_BACKOFF_MIN_S) {
+		len = WIND_BACKOFF_MAX_S;
+	}
+	if (rtc_backoff_level < 255) {
+		rtc_backoff_level++;
+	}
+	rtc_backoff         = true;
+	rtc_backoff_start_s = now_s();
+	rtc_backoff_end_s   = rtc_backoff_start_s + len;
+	episode_close("wind backoff");
+	log_w("wind: %u photos in a row without a person; PIR ignored for %lu s",
+	      rtc_wind_streak, (unsigned long)len);
+}
+
+static void backoff_finish()
+{
+	const uint32_t t = now_s();
+	const uint32_t spent = t - rtc_backoff_start_s;
+	rtc_backoff_s_total        += spent;
+	rtc_backoff_s_since_report += spent;
+	rtc_backoff  = false;
+	rtc_listen_s = t;   // WIND_QUIET_RESET_S counts from here
+	log_i("wind backoff over after %lu s; PIR armed", (unsigned long)spent);
+}
+
+// One PIR trigger: a rising edge that opened an episode or continued one.
+// The capture comes first and nothing is allowed in front of it, the radio
+// least of all (9.1). Detection judges the photo with the radio still off,
+// and the radio comes up only for a photo that is going out.
+static void handle_trigger(uint32_t t_ref_ms)
+{
+	const uint32_t t = now_s();
+	if (t - rtc_listen_s >= (uint32_t)WIND_QUIET_RESET_S &&
+	    (rtc_wind_streak || rtc_backoff_level)) {
+		log_i("wind: %d s without a trigger; streak cleared", WIND_QUIET_RESET_S);
+		rtc_wind_streak   = 0;
+		rtc_backoff_level = 0;
+	}
+	rtc_listen_s = t;
+	record_trigger();
+
+	if (rtc_ep.photos_sent >= PHOTOS_PER_EPISODE) {
+		rtc_capped_total++;
+		rtc_capped_since_report++;
+		log_i("trigger counted, not photographed: episode already has %d photos",
+		      PHOTOS_PER_EPISODE);
+		return;
+	}
+
+	frame_t f = {};
+	if (!capture(&f, t_ref_ms)) {
+		log_e("capture failed");
+		return;
+	}
+
+	bool        send;
+	const char *reason;
+#if DETECTION_ENABLED
+	if (!judge_frame(f)) {
+		// Fail open: a photo that could not be judged is better sent than lost.
+		rtc_detect_errors_total++;
+		rtc_detect_errors_since_report++;
+		send   = true;
+		reason = "detect error: sent unjudged";
+	} else if (f.hit) {
+		rtc_ep.person     = EP_PERSON_YES;
+		rtc_wind_streak   = 0;
+		rtc_backoff_level = 0;
+		send   = true;
+		reason = "person";
+	} else {
+		if (rtc_ep.person == EP_PERSON_UNCHECKED) {
+			rtc_ep.person = EP_PERSON_NO;
 		}
-
-		esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-		esp_sleep_enable_ext0_wakeup(PIN_PIR, 1);
-		esp_sleep_enable_timer_wakeup((uint64_t)BURST_SETTLE * 1000000ULL);
-
-		esp_err_t serr = esp_light_sleep_start();
-		const uint32_t t_edge = millis();   // wake-to-shutter counts from here
-		rtc_gpio_deinit(PIN_PIR);   // back to digital; see wait_for_pir_idle()
-		esp_sleep_wakeup_cause_t wcause = esp_sleep_get_wakeup_cause();
-
-		if (serr != ESP_OK) {
-			// Sleep was rejected — typically a wakeup source already pending.
-			// Never spin here: at ~250 mA a hot loop would eat days of budget
-			// out of the cell before BURST_MAX_DURATION cut it off.
-			log_w("light sleep rejected (%d), backing off", (int)serr);
-			delay(1000);
-			continue;
+		if (rtc_wind_streak < 255) {
+			rtc_wind_streak++;
 		}
-		if (wcause == ESP_SLEEP_WAKEUP_TIMER) {
-			break;   // quiet for BURST_SETTLE — the burst has settled
-		}
-		if (wcause != ESP_SLEEP_WAKEUP_EXT0) {
-			delay(100);
-			continue;   // not a PIR edge; do not count it as a trigger
-		}
+		send   = !SEND_ONLY_PERSONS;
+		reason = "no person (SEND_ONLY_PERSONS 0)";
+	}
+#else
+	send   = true;
+	reason = "unfiltered (no detector in this build)";
+#endif
 
-		record_trigger(now_s());
-		frame_t f;
-		if (capture(&f, t_edge)) {
-			buffer_push(f);
+	if (send) {
+		if (send_photo(f, reason)) {
+			rtc_ep.photos_sent++;
 		}
-		log_i("burst trigger, %d frames buffered", g_burst_n);
+	} else {
+		rtc_suppressed_total++;
+		rtc_suppressed_since_report++;
+		log_i("no person (best %.2f); suppressed", f.score);
+	}
+	heap_caps_free(f.data);
+
+	if (rtc_wind_streak >= WIND_STREAK_BACKOFF) {
+		backoff_start();
+	}
+}
+
+// Seconds until `deadline_ms`, at least 1 (a 0 timer would mean none).
+static uint32_t secs_until(uint64_t deadline_ms)
+{
+	const uint64_t t = now_ms();
+	return deadline_ms > t + 1000 ? (uint32_t)((deadline_ms - t + 999) / 1000) : 1;
+}
+
+static uint32_t min_timer(uint32_t a, uint32_t b)
+{
+	return a == 0 ? b : b == 0 ? a : a < b ? a : b;
+}
+
+// Sleep until whatever the current state is waiting for. Never returns.
+//   backoff:           the timer alone, PIR unarmed
+//   episode, D1 high:  D1 falling
+//   episode, D1 low:   D1 rising (a retrigger), or the gap running out
+//   otherwise:         enter_deep_sleep(), the idle sleep
+// The telemetry timer is folded into every one of them. If D1 has already
+// changed since it was last seen, the level wake fires at once and the next
+// wake handles the edge: nothing is lost, it just costs a boot.
+[[noreturn]] static void sleep_for_state()
+{
+	const uint32_t report_in_s = telegram_configured() ? telemetry_wake_in_s() : 0;
+	if (rtc_backoff) {
+		park_for_sleep();
+		const uint32_t left = (int32_t)(rtc_backoff_end_s - now_s()) > 0
+		                          ? rtc_backoff_end_s - now_s() : 1;
+		deep_sleep_now(-1, min_timer(left, report_in_s));
+	}
+	if (rtc_ep.open) {
+		park_for_sleep();
+		if (rtc_ep.d1_high) {
+			deep_sleep_now(0, report_in_s);
+		}
+		const uint32_t gap = secs_until(rtc_ep.fall_ms + PRESENCE_GAP_S * 1000u);
+		deep_sleep_now(1, min_timer(gap, report_in_s));
+	}
+	enter_deep_sleep();
+}
+
+// A wake inside an open episode: follow D1, and handle a retrigger.
+static void episode_event(bool d1, uint32_t t_ref_ms)
+{
+	if (d1 && !rtc_ep.d1_high) {
+		rtc_ep.d1_high = true;
+		log_i("retrigger %lu s into the episode",
+		      (unsigned long)((now_ms() - rtc_ep.start_ms) / 1000));
+		handle_trigger(t_ref_ms);
+	} else if (!d1 && rtc_ep.d1_high) {
+		rtc_ep.d1_high = false;
+		rtc_ep.fall_ms = now_ms();
+	}
+	if (rtc_ep.open && !rtc_ep.d1_high &&
+	    now_ms() - rtc_ep.fall_ms >= (uint64_t)PRESENCE_GAP_S * 1000u) {
+		episode_close("D1 quiet");
 	}
 }
 
@@ -1508,11 +1635,11 @@ static void reset_stats_note(esp_reset_reason_t r)
 // time. ISR dispatch would get past the last, but it is not compiled into
 // these builds' sdkconfig.
 //
-// A deadline that passes during one of the light sleeps in run_burst() or
+// A deadline that passes during one of the light sleeps in
 // wait_for_pir_idle() fires as soon as the node wakes: esp_light_sleep_start()
 // winds esp_timer's counter forward by the time slept, and the S3's systimer
 // raises an alarm whose target is already behind the counter. Those sleeps
-// last BURST_SETTLE at most.
+// last a second each.
 static void wake_deadline_expired(void *)
 {
 	esp_system_abort("wake deadline");
@@ -1554,10 +1681,9 @@ static_assert(framesize_pixels(CAM_FRAMESIZE) != 0,
                               TELEGRAM_STALL_MS / 1000)
 // The driver's JPEG buffer (cam_hal.c, FRAME_SIZE_AUTO) bounds a still.
 #define STILL_MAX_BYTES   (framesize_pixels(CAM_FRAMESIZE) / 5 + TG_MULTIPART_MAX)
-static_assert(WAKE_DEADLINE_S > BURST_MAX_DURATION + BURST_SETTLE + 2 * PIR_IDLE_MAX_S +
+static_assert(WAKE_DEADLINE_S > PIR_IDLE_MAX_S +
                                 (WIFI_CONNECT_TIMEOUT_MS + WIFI_DHCP_TIMEOUT_MS) / 1000 +
-                                2 * DNS_LOOKUP_MAX_S +
-                                BURST_MAX_FRAMES * TG_POST_MAX_S(STILL_MAX_BYTES),
+                                2 * DNS_LOOKUP_MAX_S + TG_POST_MAX_S(STILL_MAX_BYTES),
               "WAKE_DEADLINE_S no longer covers the longest normal wake (config.h)");
 
 // Never stopped: every path after setup() arms it ends in deep sleep, which
@@ -1634,7 +1760,6 @@ void setup()
 	reset_stats_note(esp_reset_reason());
 
 	if (!rtc_initialised) {
-		memset(rtc_trigger_log, 0xFF, sizeof(rtc_trigger_log));  // TRIGGER_SLOT_EMPTY
 		memset(rtc_bssid, 0, sizeof(rtc_bssid));
 		rtc_initialised = true;
 		log_i("cold boot");
@@ -1649,6 +1774,10 @@ void setup()
 	                        cause == ESP_SLEEP_WAKEUP_TIMER)
 	                           ? 0u : (uint32_t)DEPLOY_ENTRY_WINDOW_MS)) {
 		log_i("BOOT held — deployment mode, sleep bypassed");
+		// Whatever episode or backoff was running is over: the node comes
+		// out of this mode through enter_deep_sleep(), listening afresh.
+		episode_close("deployment mode");
+		rtc_backoff = false;
 		s_deploy_mode = true;
 		deploy_mode_begin();
 		return;   // setup() returns only here; loop() takes over
@@ -1658,11 +1787,9 @@ void setup()
 	// sleep and runs against the wake deadline (config.h).
 	wake_deadline_arm();
 
-	if (cause != ESP_SLEEP_WAKEUP_EXT0) {
+	if (cause != ESP_SLEEP_WAKEUP_EXT0 && cause != ESP_SLEEP_WAKEUP_TIMER) {
 		// Power-on or reset, not a real trigger. Report once so a node that
-		// has been reset in the field says so, then go to sleep. The
-		// telemetry timer armed in enter_deep_sleep() lands here too, and
-		// reports if one is due.
+		// has been reset in the field says so, then go to sleep.
 		log_i("wake cause %d (not PIR)", (int)cause);
 
 		// Unless the reset was the node falling over. RTC_DATA_ATTR state is
@@ -1686,95 +1813,37 @@ void setup()
 		enter_deep_sleep();
 	}
 
-	const uint32_t t_wake = now_s();
-	record_trigger(t_wake);
+	// ---- The trigger flow (config.h) ---------------------------------------
+	// Driven by the state in RTC memory and D1 as it is now, not by the wake
+	// cause alone: a timer wake may be a backoff ending, an episode's gap
+	// running out or the telemetry report, and ext0 means whichever level
+	// sleep_for_state() armed. The capture, when there is one, is still the
+	// first slow thing to happen (9.1).
+	const bool d1 = gpio_get_level(PIN_PIR) == 1;
 
-	// ---- Capture first, unconditionally -----------------------------------
-	// Nothing is allowed in front of this. The AM312 has already spent its own
-	// detection latency getting us here and the subject is still walking, so
-	// every millisecond between the wake and the shutter is scene that is gone.
-	//
-	// The radio in particular is NOT started ahead of the capture, tempting as
-	// the overlap looks: esp_wifi_init() plus esp_wifi_start() is tens of
-	// milliseconds of *blocking* setup on this task, and paying it here would
-	// trade the photograph for the transport that carries it. The radio starts
-	// below, once the frame is safe in PSRAM.
-	frame_t f;
-	if (!capture(&f, t_setup)) {
-		log_e("capture failed");
-		enter_deep_sleep();
+	if (rtc_backoff) {
+		if ((int32_t)(now_s() - rtc_backoff_end_s) < 0) {
+			// The telemetry timer, mid-backoff.
+			maybe_send_telemetry_only();
+			sleep_for_state();
+		}
+		backoff_finish();
+		if (d1) {
+			// Still high: exactly what the armed ext0 wake would fire on at
+			// once, so take it as the trigger now.
+			episode_open();
+			handle_trigger(t_setup);
+		}
+	} else if (rtc_ep.open) {
+		episode_event(d1, t_setup);
+	} else if (cause == ESP_SLEEP_WAKEUP_EXT0) {
+		episode_open();
+		handle_trigger(t_setup);
 	}
-	buffer_push(f);
+	// Anything else is the telemetry timer with nothing going on.
 
-	const int in_window = triggers_in_window(t_wake);
-	log_i("trigger; %d in last %d s", in_window, BURST_WINDOW);
-
-	if (in_window < BURST_COUNT) {
-		// ISOLATED (9.2): send immediately, no detection. An animal or person
-		// walking past trips the PIR once or twice — detection would cost
-		// energy for nothing.
-		//
-		// This branch is a guaranteed transmission, so the radio can start
-		// right now and associate underneath the credential check and caption
-		// build in send_frames().
-#if WIFI_EARLY_START
-		wifi_begin_async();
-#endif
-		send_frames("isolated", /*only_hits=*/false);
-		enter_deep_sleep();
-	}
-
-	// BURST (9.2): do not send yet. Keep buffering through light sleep until
-	// the scene settles, then let detection decide.
-	//
-	// The radio stays off for the whole of run_burst(), and this is the one
-	// place in the cycle where starting it early would be actively harmful: a
-	// burst can hold us here for up to BURST_MAX_DURATION (600 s), and an
-	// associated station cannot idle at light-sleep current — it has to keep
-	// waking for its DTIM beacons. Ten minutes of that would outspend the
-	// entire daily budget in 7.
-	run_burst();
-
-	// ---- Radio and inference in parallel ----------------------------------
-	// Safe now: the burst has settled so nothing further will be captured, and
-	// every frame is already in PSRAM. Association is a few hundred ms to a
-	// couple of seconds; inference over up to BURST_MAX_FRAMES frames is the
-	// longest single step in the whole cycle. Overlapping them makes the wake
-	// cost about the larger of the two instead of their sum.
-	//
-	// Started up front only when a telemetry report is already owed, because
-	// that is the one case where the transmission is certain regardless of
-	// what the detector finds. Otherwise the radio waits for the first hit —
-	// see detect_over_buffer().
-	int errors = 0;
-#if WIFI_EARLY_START
-	if (telemetry_due()) {
-		wifi_begin_async();
-	}
-	const int buffered = g_burst_n;
-	const int hits = detect_over_buffer(wifi_begin_async, &errors);
-#else
-	const int buffered = g_burst_n;
-	const int hits = detect_over_buffer(nullptr, &errors);
-#endif
-
-	// Counted first: send_frames() builds the captions from these and then
-	// clears the since-report ones, so counting afterwards would report this
-	// burst's suppressions with the next report instead.
-	rtc_detect_errors_since_report += errors;
-	rtc_detect_errors_total        += errors;
-	if (hits + errors > 0) {
-		rtc_suppressed_since_report += (buffered - hits - errors);
-		rtc_suppressed_total        += (buffered - hits - errors);
-		send_frames("burst_detected", /*only_hits=*/true);
-	} else {
-		rtc_suppressed_since_report += buffered;
-		rtc_suppressed_total        += buffered;
-		log_i("burst of %d frames suppressed", buffered);
-		maybe_send_telemetry_only();
-	}
-
-	enter_deep_sleep();
+	maybe_send_telemetry_only();
+	sleep_for_state();
 }
 
 void loop()

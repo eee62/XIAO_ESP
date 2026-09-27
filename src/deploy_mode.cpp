@@ -339,6 +339,13 @@ static String status_json()
 	j += ",\"supp_since\":";    j += s.suppressed_since_report;
 	j += ",\"derr_total\":";    j += s.detect_errors_total;
 	j += ",\"derr_since\":";    j += s.detect_errors_since_report;
+	j += ",\"sent_total\":";    j += s.photos_sent_total;
+	j += ",\"sent_since\":";    j += s.photos_sent_since_report;
+	j += ",\"dropped\":";       j += s.photos_dropped_total;
+	j += ",\"capped\":";        j += s.capped_total;
+	j += ",\"wind_streak\":";   j += s.wind_streak;
+	j += ",\"backoff_left\":";  j += s.backoff_left_s;
+	j += ",\"backoff_total\":"; j += s.backoff_s_total;
 	j += ",\"last_report\":";   j += s.last_report_s;
 	j += ",\"ap_cache\":";      j += s.have_ap_cache ? "true" : "false";
 	j += ",\"net_mode\":\"";     j += s.using_dhcp ? "dhcp" : "static";
@@ -351,9 +358,10 @@ static String status_json()
 	j += ",\"psram_size\":";    j += (uint32_t)ESP.getPsramSize();
 	j += ",\"model\":\"" DEPLOY_MODEL_NAME "\"";
 	j += ",\"thr\":";           j += String(DETECT_SCORE_THRESHOLD, 2);
-	j += ",\"burst_n\":";       j += BURST_COUNT;
-	j += ",\"burst_w\":";       j += BURST_WINDOW;
-	j += ",\"burst_settle\":";  j += BURST_SETTLE;
+	j += ",\"persons_only\":";  j += SEND_ONLY_PERSONS && DETECTION_ENABLED ? "true" : "false";
+	j += ",\"per_ep\":";        j += PHOTOS_PER_EPISODE;
+	j += ",\"gap\":";           j += PRESENCE_GAP_S;
+	j += ",\"hold\":";          j += PIR_HOLD_S;
 	j += ",\"sta_ssid\":\"";  j += json_escape(WIFI_SSID);
 	j += "\"";
 	j += ",\"telegram\":";     j += telegram_configured() ? "true" : "false";
@@ -629,10 +637,18 @@ function render(d){
   row('Orientation','v-flip '+(d.vflip?'on':'off')+' · mirror '+(d.hmirror?'on':'off'));
   row('Last frame',d.frames?kb(d.frame_len)+' · '+d.frames+' served':'—');
   row('Triggers',d.trig_total+' total · '+d.trig_since+' unreported');
-  row('Suppressed',d.supp_total+' total · '+d.supp_since+' unreported');
+  row('Photos sent',d.sent_total+' total · '+d.sent_since+' unreported · '+
+    d.dropped+' dropped');
+  row('Suppressed',d.supp_total+' total · '+d.supp_since+' unreported · '+
+    d.capped+' over the visit cap');
   row('Detect errors',d.derr_total+' total · '+d.derr_since+' unreported');
   row('Last report',d.last_report?dur(d.uptime-d.last_report)+' ago':'never');
-  row('Burst rule',d.burst_n+' in '+d.burst_w+'s, settle '+d.burst_settle+'s');
+  row('Photo rule',(d.persons_only?'persons only':'everything')+
+    ' · at most '+d.per_ep+' per visit');
+  row('PIR timing','hold '+d.hold+' s (PIR_HOLD_S) · visit gap '+d.gap+' s');
+  row('Wind',d.backoff_left?'PIR ignored for '+dur(d.backoff_left)+' more':
+    (d.wind_streak?d.wind_streak+' empty photos in a row':'calm')+
+    (d.backoff_total?' · ignored '+dur(d.backoff_total)+' so far':''));
   row('Detection',d.model+(d.model=='disabled'?'':' @ '+d.thr));
   row('Uplink',d.sta_ssid+' → Telegram '+(d.telegram?'ready':'NOT CONFIGURED'));
   row('Network',d.net_mode);
