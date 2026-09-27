@@ -77,6 +77,26 @@
 #define CAM_FRAMESIZE        FRAMESIZE_SVGA  // 800x600
 // 0..63, lower = better = bigger.
 #define CAM_JPEG_QUALITY     10
+
+// Frame-buffer overflow. In JPEG mode esp32-camera sizes each frame buffer at
+// width x height / 5 (cam_hal.c, CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE_AUTO). A
+// busy scene, foliage at high resolution and a fine quality, can outgrow it:
+// the driver truncates the frame, drops it for its missing EOI marker, and
+// esp_camera_fb_get() returns NULL only after its 4 s timeout. capture() then
+// raises the quality number by CAM_QUALITY_STEP and tries once more.
+//
+// The quality that worked is kept in RTC memory for the next wake, so a busy
+// scene pays the 4 s once rather than on every trigger. It creeps back one
+// step at a time toward CAM_JPEG_QUALITY whenever a frame comes in under
+// CAM_QUALITY_RELAX_PCT of the buffer, so one windy afternoon does not cost
+// detail for the rest of the deployment. Telemetry reports the value in use.
+//
+// The Kconfig alternative, CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE_CUSTOM, exists
+// but cannot take effect here: esp32-camera is a prebuilt archive in the
+// Arduino libs, and the detect envs' custom_sdkconfig rebuild does not
+// compile it. bench-nodetect has no rebuild at all.
+#define CAM_QUALITY_STEP       4
+#define CAM_QUALITY_RELAX_PCT  60
 #define CAM_XCLK_HZ          20000000
 
 // Sensor settings, applied by camera_apply_settings() after every init: the

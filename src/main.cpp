@@ -111,6 +111,11 @@ RTC_DATA_ATTR static uint32_t rtc_last_report_s = 0;
 // deployment-mode status page.
 RTC_DATA_ATTR static uint32_t rtc_last_report_attempt_s = REPORT_NEVER;
 
+// JPEG quality number the next capture starts at: CAM_JPEG_QUALITY until a
+// frame overflows the driver's buffer, then whatever worked (config.h,
+// CAM_QUALITY_STEP).
+RTC_DATA_ATTR static uint8_t  rtc_cam_quality = CAM_JPEG_QUALITY;
+
 // Cached association parameters (9.4) — skips the scan on every wake.
 RTC_DATA_ATTR static bool     rtc_have_ap = false;
 RTC_DATA_ATTR static uint8_t  rtc_bssid[6];
@@ -319,7 +324,7 @@ bool camera_up()
 	cfg.ledc_channel = LEDC_CHANNEL_0;
 	cfg.pixel_format = PIXFORMAT_JPEG;
 	cfg.frame_size   = CAM_FRAMESIZE;
-	cfg.jpeg_quality = CAM_JPEG_QUALITY;
+	cfg.jpeg_quality = rtc_cam_quality;
 	// Two buffers, not one, so a discarded warm-up frame does not also cost
 	// the frame after it. In the installed cam_hal.c a JPEG frame ends at the
 	// VSYNC that starts the next one; cam_task() then queues it and looks for
@@ -379,9 +384,26 @@ static bool capture(frame_t *out, uint32_t t_ref_ms)
 	// fall after the deadline. Signed, because the first frames can start
 	// before t_init: streaming begins inside esp_camera_init().
 	const uint32_t t_init = millis();
-	int discarded = 0;
+	int  q = rtc_cam_quality;
+	bool raised = false;
+	int  discarded = 0;
 	camera_fb_t *fb;
-	while ((fb = esp_camera_fb_get()) != nullptr) {
+	for (;;) {
+		fb = esp_camera_fb_get();
+		if (!fb) {
+			// Most likely a JPEG that outgrew the frame buffer (config.h,
+			// CAM_QUALITY_STEP). A coarser quality, once; the sensor takes it
+			// while streaming, and the warm-up carries on where it was.
+			sensor_t *s = esp_camera_sensor_get();
+			const int q2 = q + CAM_QUALITY_STEP > 63 ? 63 : q + CAM_QUALITY_STEP;
+			if (raised || q2 == q || !s || s->set_quality(s, q2) != 0) {
+				break;
+			}
+			log_w("no frame at JPEG quality %d; retrying once at %d", q, q2);
+			q = q2;
+			raised = true;
+			continue;
+		}
 		if (discarded >= CAM_WARMUP_MIN_FRAMES &&
 		    (int32_t)(fb_start_ms(fb) - t_init) >= CAM_WARMUP_MS) {
 			break;
@@ -391,10 +413,33 @@ static bool capture(frame_t *out, uint32_t t_ref_ms)
 	}
 	if (fb) {
 		log_i("wake-to-shutter %lu ms (frame start; %d warm-up frames over "
-		      "%lu ms)", (unsigned long)(fb_start_ms(fb) - t_ref_ms), discarded,
-		      (unsigned long)(fb_start_ms(fb) - t_init));
+		      "%lu ms), %u bytes at quality %d",
+		      (unsigned long)(fb_start_ms(fb) - t_ref_ms), discarded,
+		      (unsigned long)(fb_start_ms(fb) - t_init), (unsigned)fb->len, q);
+
+		// What the next wake starts at. A raised value stands; otherwise a
+		// frame well inside the buffer earns one step back toward
+		// CAM_JPEG_QUALITY. The buffer is w x h / 5, cam_hal.c's own
+		// FRAME_SIZE_AUTO formula, since camera_fb_t does not carry it.
+		const size_t cap = (size_t)fb->width * fb->height / 5;
+		int next = q;
+		if (!raised && q > CAM_JPEG_QUALITY &&
+		    fb->len < cap * CAM_QUALITY_RELAX_PCT / 100) {
+			next = q - CAM_QUALITY_STEP < CAM_JPEG_QUALITY
+			           ? CAM_JPEG_QUALITY : q - CAM_QUALITY_STEP;
+		}
+		if (next != rtc_cam_quality) {
+			log_i("JPEG quality for the next capture: %d -> %d",
+			      rtc_cam_quality, next);
+			rtc_cam_quality = (uint8_t)next;
+		}
 	} else {
-		log_e("fb_get failed after %d warm-up frames", discarded);
+		log_e("fb_get failed after %d warm-up frames, quality %d", discarded, q);
+		// Nothing worked, but the next wake may as well start from the
+		// coarser setting, and raise again from there if it has to.
+		if (raised) {
+			rtc_cam_quality = (uint8_t)q;
+		}
 	}
 
 	bool ok = false;
@@ -1037,6 +1082,9 @@ static String telemetry_text(const char *reason, float score, int idx, int total
 		c += mv;
 		c += " mV";
 	}
+
+	c += "\njpeg quality ";
+	c += rtc_cam_quality;
 
 	c += "\nresets: brownout ";
 	c += rtc_reset_stats.brownout;
