@@ -156,6 +156,8 @@ struct frame_t {
 	float    score;
 	bool     hit;
 	bool     err;    // detection could not run on it; sent unjudged
+	uint32_t shutter_ms;   // capture()'s t_ref_ms to the frame's start
+	uint8_t  quality;      // JPEG quality number it was taken at
 };
 
 static frame_t g_burst[BURST_MAX_FRAMES];
@@ -453,6 +455,8 @@ static bool capture(frame_t *out, uint32_t t_ref_ms)
 			out->score = 0.0f;
 			out->hit   = false;
 			out->err   = false;
+			out->shutter_ms = fb_start_ms(fb) - t_ref_ms;
+			out->quality    = (uint8_t)q;
 			ok = true;
 		} else {
 			log_e("PSRAM alloc failed for %u byte frame", (unsigned)fb->len);
@@ -728,6 +732,45 @@ static int detect_over_buffer(void (*on_first_hit)(), int *errors)
 #endif // DETECTION_ENABLED
 
 // ---------------------------------------------------------------------------
+// Deployment mode's cold-capture test (deploy_mode.h). The same capture() and
+// detection a PIR wake runs, so what it reports is what the field gets, minus
+// the boot before setup() that a real wake also pays.
+// ---------------------------------------------------------------------------
+void deploy_cold_test(cold_test_t *out)
+{
+	*out = {};
+	const uint32_t t0 = millis();
+	frame_t f = {};
+	const bool ok = capture(&f, t0);
+	out->capture_ms = millis() - t0;
+	if (!ok) {
+		return;
+	}
+	out->ok                 = true;
+	out->wake_to_shutter_ms = f.shutter_ms;
+	out->quality            = f.quality;
+	out->jpeg               = f.data;
+	out->jpeg_len           = f.len;
+
+#if DETECTION_ENABLED
+	detector_t *det = detector_open(&out->load_ms);
+	if (!det) {
+		out->detect = COLD_DETECT_ERROR;
+		return;
+	}
+	if (detect_frame(det, f, &out->decode_ms, &out->infer_ms)) {
+		out->detect = f.hit ? COLD_DETECT_HIT : COLD_DETECT_NONE;
+		out->score  = f.score;
+	} else {
+		out->detect = COLD_DETECT_ERROR;
+	}
+	delete det;
+#else
+	out->detect = COLD_DETECT_OFF;
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // Telemetry (9.3)
 // ---------------------------------------------------------------------------
 int32_t battery_mv()
@@ -759,6 +802,7 @@ void deploy_fill_status(deploy_status_t *out)
 	out->have_ap_cache              = rtc_have_ap;
 	out->using_dhcp                 = rtc_use_dhcp;
 	out->ap_channel                 = rtc_channel;
+	out->cam_quality                = rtc_cam_quality;
 	memcpy(out->ap_bssid, rtc_bssid, sizeof(out->ap_bssid));
 }
 

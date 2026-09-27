@@ -4,11 +4,13 @@
 // block in include/config.h.
 //
 // Threading: every request handler below runs on the AsyncTCP task. Camera
-// *power* transitions and esp_camera_init()/deinit() happen only in
-// deploy_mode_service(), i.e. on the Arduino loop task, exactly as they do in
-// the normal duty cycle. Handlers may only pull frames, and only while holding
-// a use-count taken under g_cam_lock — which is what stops the service task
-// tearing the sensor down underneath an in-flight response.
+// *power* transitions, esp_camera_init()/deinit() and frame-size changes
+// happen only in deploy_mode_service(), i.e. on the Arduino loop task,
+// exactly as they do in the normal duty cycle. So do full-size stills and the
+// cold-capture test: handlers only ask for them and serve the result. The one
+// thing a handler pulls itself is the live stream, and only while holding a
+// use-count taken under g_cam_lock — which is what stops the service task
+// resizing or tearing the sensor down underneath an in-flight response.
 
 #include "deploy_mode.h"
 
@@ -16,6 +18,7 @@
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <esp_camera.h>
+#include <esp_heap_caps.h>
 #include <esp_system.h>
 #include <driver/gpio.h>
 #include <freertos/FreeRTOS.h>
@@ -54,16 +57,87 @@ static DNSServer g_dns;
 
 // ---------------------------------------------------------------------------
 // Camera arbitration
+//
+// PREVIEW streams at DEPLOY_PREVIEW_FRAMESIZE; FULL is CAM_FRAMESIZE, for
+// stills. Only the loop task changes mode, and only while no handler holds a
+// use. SWITCHING marks a change in progress, so no stream can start against a
+// sensor that is being resized, power-cycled or run through the cold test.
 // ---------------------------------------------------------------------------
+enum cam_mode_t : uint8_t { CAM_OFF = 0, CAM_PREVIEW, CAM_FULL, CAM_SWITCHING };
+
+// The enum is ordered by size for the 4:3 sizes involved; see config.h.
+static_assert(DEPLOY_PREVIEW_FRAMESIZE <= CAM_FRAMESIZE,
+              "DEPLOY_PREVIEW_FRAMESIZE must not be larger than CAM_FRAMESIZE");
+
 static SemaphoreHandle_t g_cam_lock;
-static bool     g_cam_on          = false;
-static int      g_cam_users       = 0;
-static uint32_t g_cam_request_ms  = 0;
-static uint32_t g_cam_retry_at    = 0;
-static bool     g_stream_open     = false;   // async task only; single-threaded there
+static cam_mode_t  g_cam_mode        = CAM_OFF;
+static int         g_cam_users       = 0;
+static uint32_t    g_cam_request_ms  = 0;   // last request for the sensor at all
+static uint32_t    g_full_request_ms = 0;   // last request for it at full size
+static bool        g_stream_open     = false;   // async task only; single-threaded there
+// What the driver actually set for CAM_FRAMESIZE: esp_camera_init() clamps a
+// size past the sensor's maximum, FRAMESIZE_5MP to QSXGA on the OV5640.
+static framesize_t g_full_size       = CAM_FRAMESIZE;
+
+// Loop task only.
+static uint32_t    g_cam_retry_at    = 0;
+static uint32_t    g_settle_until    = 0;   // no still from a frame started before this
 
 static uint32_t g_frames_served   = 0;
 static size_t   g_last_frame_len  = 0;
+
+// A JPEG copied out of the driver into PSRAM, shared between the loop task
+// that made it and whichever responses are sending it: a slow client never
+// holds a camera buffer, and a newer still never frees one mid-send.
+struct psram_blob_t {
+	uint8_t *data = nullptr;
+	size_t   len  = 0;
+	~psram_blob_t() { heap_caps_free(data); }
+};
+typedef std::shared_ptr<psram_blob_t> blob_ref;
+
+// Takes ownership of a heap_caps buffer.
+static blob_ref blob_adopt(uint8_t *data, size_t len)
+{
+	blob_ref b(new (std::nothrow) psram_blob_t());
+	if (!b) {
+		heap_caps_free(data);
+		return blob_ref();
+	}
+	b->data = data;
+	b->len  = len;
+	return b;
+}
+
+static blob_ref blob_copy(const uint8_t *src, size_t len)
+{
+	uint8_t *data = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+	if (!data) {
+		return blob_ref();
+	}
+	memcpy(data, src, len);
+	return blob_adopt(data, len);
+}
+
+// Full-size stills, all under g_cam_lock. A request bumps g_still_want; the
+// loop task answers every request made so far with one frame, or a failure,
+// by catching g_still_done up.
+static blob_ref g_still;
+static uint32_t g_still_want   = 0;
+static uint32_t g_still_done   = 0;
+static bool     g_still_failed = false;
+static uint32_t g_still_req_ms = 0;   // newest request; the frame must be newer
+
+// Cold-capture test. g_cold holds the last result with its jpeg pointer
+// cleared; the JPEG itself is g_cold_jpeg. All under g_cam_lock except the
+// request flag.
+static volatile bool     g_cold_req     = false;
+static volatile uint32_t g_cold_req_ms  = 0;
+static bool              g_cold_running = false;
+static bool              g_cold_busy    = false;   // refused: a stream held the camera
+static uint32_t          g_cold_seq     = 0;       // results published
+static cold_test_t       g_cold         = {};
+static blob_ref          g_cold_jpeg;
 
 // PIR walk test.
 static bool     g_pir_level       = false;
@@ -75,15 +149,16 @@ enum { ACTION_NONE = 0, ACTION_ARM, ACTION_REBOOT };
 static volatile uint8_t  g_action    = ACTION_NONE;
 static volatile uint32_t g_action_at = 0;
 
-// Take a use on the camera. Fails while the sensor is down, which is the
-// caller's cue to answer 503 and let the client retry — bringing it up here
-// would mean running esp_camera_init() on the async task.
+// Take a use on the camera for the live stream. Fails unless the sensor is up
+// at preview size, which is the caller's cue to answer 503 and let the client
+// retry — bringing it up or resizing it here would mean doing it on the async
+// task. The attempt itself counts as a request, so the loop task will.
 static bool cam_use_begin()
 {
 	bool ok = false;
 	xSemaphoreTake(g_cam_lock, portMAX_DELAY);
 	g_cam_request_ms = millis();
-	if (g_cam_on) {
+	if (g_cam_mode == CAM_PREVIEW) {
 		g_cam_users++;
 		ok = true;
 	}
@@ -101,9 +176,16 @@ static void cam_use_end()
 	xSemaphoreGive(g_cam_lock);
 }
 
+// When a frame started, on the millis() clock (esp_timer, like the stamp
+// cam_hal.c puts on each buffer).
+static uint32_t fb_start_ms(const camera_fb_t *fb)
+{
+	return (uint32_t)(fb->timestamp.tv_sec * 1000 + fb->timestamp.tv_usec / 1000);
+}
+
 // ---------------------------------------------------------------------------
-// JPEG feed shared by /snapshot (one frame, known length) and /stream
-// (multipart, open-ended).
+// JPEG feed for /stream (multipart, open-ended). /snapshot used to share it;
+// stills now come from the loop task instead (service_still()).
 //
 // The state is owned by a shared_ptr captured in the response's filler lambda,
 // so a client that walks away mid-frame destroys the response, destroys the
@@ -114,7 +196,6 @@ struct jpeg_feed_t {
 	camera_fb_t *fb        = nullptr;
 	String       hdr;
 	size_t       cursor    = 0;
-	bool         multipart = false;
 	bool         finished  = false;
 
 	~jpeg_feed_t()
@@ -122,9 +203,7 @@ struct jpeg_feed_t {
 		if (fb) {
 			esp_camera_fb_return(fb);
 		}
-		if (multipart) {
-			g_stream_open = false;
-		}
+		g_stream_open = false;
 		cam_use_end();
 	}
 };
@@ -147,13 +226,11 @@ static size_t jpeg_feed_fill(const std::shared_ptr<jpeg_feed_t> &st,
 		g_frames_served++;
 		g_last_frame_len = st->fb->len;
 		st->cursor = 0;
-		if (st->multipart) {
-			st->hdr  = "\r\n--" MJPEG_BOUNDARY "\r\n"
-			           "Content-Type: image/jpeg\r\n"
-			           "Content-Length: ";
-			st->hdr += st->fb->len;
-			st->hdr += "\r\n\r\n";
-		}
+		st->hdr  = "\r\n--" MJPEG_BOUNDARY "\r\n"
+		           "Content-Type: image/jpeg\r\n"
+		           "Content-Length: ";
+		st->hdr += st->fb->len;
+		st->hdr += "\r\n\r\n";
 	}
 
 	const size_t hlen  = st->hdr.length();
@@ -180,9 +257,6 @@ static size_t jpeg_feed_fill(const std::shared_ptr<jpeg_feed_t> &st,
 	if (st->cursor >= total) {
 		esp_camera_fb_return(st->fb);
 		st->fb = nullptr;
-		if (!st->multipart) {
-			st->finished = true;   // /snapshot is one frame and done
-		}
 	}
 	return n;
 }
@@ -230,15 +304,29 @@ static String status_json()
 	deploy_fill_status(&s);
 
 	xSemaphoreTake(g_cam_lock, portMAX_DELAY);
-	const bool cam_on = g_cam_on;
-	const int  users  = g_cam_users;
+	const cam_mode_t  mode  = g_cam_mode;
+	const int         users = g_cam_users;
+	const framesize_t full  = g_full_size;
 	xSemaphoreGive(g_cam_lock);
+	static const char *const MODE_NAMES[] = {"off", "preview", "full", "switching"};
 
 	String j;
-	j.reserve(768);
+	j.reserve(1024);
 	j += "{\"uptime\":";        j += now_s();
-	j += ",\"cam\":";           j += cam_on ? "true" : "false";
+	j += ",\"cam\":";           j += mode != CAM_OFF ? "true" : "false";
+	j += ",\"cam_mode\":\"";     j += MODE_NAMES[mode];
+	j += "\"";
 	j += ",\"cam_users\":";     j += users;
+	// Active camera settings: stills are CAM_FRAMESIZE as the driver set it,
+	// at the quality the next capture starts from (config.h,
+	// CAM_QUALITY_STEP); orientation is what camera_apply_settings() writes.
+	j += ",\"still_w\":";       j += resolution[full].width;
+	j += ",\"still_h\":";       j += resolution[full].height;
+	j += ",\"prev_w\":";        j += resolution[DEPLOY_PREVIEW_FRAMESIZE].width;
+	j += ",\"prev_h\":";        j += resolution[DEPLOY_PREVIEW_FRAMESIZE].height;
+	j += ",\"q\":";             j += s.cam_quality;
+	j += ",\"vflip\":";         j += CAM_VFLIP;
+	j += ",\"hmirror\":";       j += CAM_HMIRROR;
 	j += ",\"frames\":";        j += g_frames_served;
 	j += ",\"frame_len\":";     j += (uint32_t)g_last_frame_len;
 	j += ",\"pir\":";           j += g_pir_level ? 1 : 0;
@@ -269,6 +357,36 @@ static String status_json()
 	j += ",\"sta_ssid\":\"";  j += json_escape(WIFI_SSID);
 	j += "\"";
 	j += ",\"telegram\":";     j += telegram_configured() ? "true" : "false";
+	j += "}";
+	return j;
+}
+
+static String cold_json()
+{
+	xSemaphoreTake(g_cam_lock, portMAX_DELAY);
+	const cold_test_t r       = g_cold;
+	const uint32_t    seq     = g_cold_seq;
+	const bool        running = g_cold_running || g_cold_req;
+	const bool        busy    = g_cold_busy;
+	xSemaphoreGive(g_cam_lock);
+	static const char *const DETECT_NAMES[] = {"off", "none", "hit", "error"};
+
+	String j;
+	j.reserve(320);
+	j += "{\"seq\":";       j += seq;
+	j += ",\"running\":";   j += running ? "true" : "false";
+	j += ",\"busy\":";      j += busy ? "true" : "false";
+	j += ",\"ok\":";        j += r.ok ? "true" : "false";
+	j += ",\"w2s\":";       j += r.wake_to_shutter_ms;
+	j += ",\"cap_ms\":";    j += r.capture_ms;
+	j += ",\"len\":";       j += (uint32_t)r.jpeg_len;
+	j += ",\"q\":";         j += r.quality;
+	j += ",\"det\":\"";      j += DETECT_NAMES[r.detect];
+	j += "\"";
+	j += ",\"score\":";     j += String(r.score, 2);
+	j += ",\"load_ms\":";   j += r.load_ms;
+	j += ",\"dec_ms\":";    j += r.decode_ms;
+	j += ",\"inf_ms\":";    j += r.infer_ms;
 	j += "}";
 	return j;
 }
@@ -321,6 +439,14 @@ letter-spacing:.07em;margin:2px 0 8px}
 background:#000c;border:1px solid var(--line);border-radius:7px;padding:8px 14px;
 font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none}
 #toast.show{opacity:1}
+a{color:var(--accent)}
+.fbig{display:flex;align-items:baseline;gap:12px;margin-bottom:8px}
+#fsize{font-size:44px;font-weight:700;line-height:1;font-variant-numeric:tabular-nums}
+.fbig small{color:var(--dim);font-size:14px}
+.fview{background:#000;border-radius:7px;overflow:hidden;display:flex;
+justify-content:center}
+#fcv{display:block}
+.fsub{color:var(--dim);font-size:12px;margin-top:6px}
 </style></head><body>
 
 <header><h1>Wildlife node</h1><small id="conn">connecting…</small></header>
@@ -331,7 +457,23 @@ font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none}
   <div class="row">
     <button id="live" class="on">Live</button>
     <button id="snap">Snapshot</button>
+    <button id="focus">Focus</button>
   </div>
+</section>
+
+<section class="card" id="fcard" hidden>
+  <div class="sec">Focus &mdash; centre at 100%, one sensor pixel per screen pixel</div>
+  <div class="fbig"><span id="fsize">&mdash;</span><small id="fpeak"></small></div>
+  <div class="fview"><canvas id="fcv"></canvas></div>
+  <div class="fsub" id="fsub">Turn the lens slowly. Same scene, same quality:
+    the bigger the JPEG, the more fine detail is in focus.</div>
+  <div class="row"><button id="freset">Reset peak</button></div>
+</section>
+
+<section class="card">
+  <div class="sec">Cold capture &mdash; what a PIR wake produces</div>
+  <div class="grid" id="cold"><div>Result</div><div>not run yet</div></div>
+  <div class="row"><button id="coldbtn">Run cold capture</button></div>
 </section>
 
 <section class="card pir">
@@ -357,7 +499,7 @@ font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none}
 
 <script>
 var $=function(s){return document.getElementById(s)};
-var live=true, streaming=false, fails=0;
+var live=true, streaming=false, fails=0, focusing=false, peak=0;
 
 function toast(m){var t=$('toast');t.textContent=m;t.className='show';
   clearTimeout(toast.t);toast.t=setTimeout(function(){t.className=''},2200)}
@@ -368,6 +510,7 @@ function dur(s){if(s<0)return'-';var d=Math.floor(s/86400);s%=86400;
   return s+'s'}
 function kb(n){return n<1024?n+' B':n<1048576?(n/1024).toFixed(0)+' kB':
   (n/1048576).toFixed(2)+' MB'}
+function kb1(n){return (n/1024).toFixed(1)+' kB'}
 
 function startStream(){if(streaming)return;streaming=true;
   var v=$('view');v.onload=function(){v.className='shown';$('vmsg').textContent=''};
@@ -377,16 +520,86 @@ function startStream(){if(streaming)return;streaming=true;
 function stopStream(){streaming=false;var v=$('view');v.src='';v.className='';
   $('vmsg').textContent='camera off'}
 
+function pauseLive(){live=false;$('live').className='';stopStream()}
+function stopFocus(){focusing=false;$('focus').className='';$('fcard').hidden=true}
+
 $('live').onclick=function(){live=!live;this.className=live?'on':'';
-  if(!live){stopStream();$('vmsg').textContent='preview paused'}}
-$('snap').onclick=function(){live=false;$('live').className='';stopStream();
+  if(live)stopFocus();else{stopStream();$('vmsg').textContent='preview paused'}}
+// Full size: the loop task switches the sensor up and back, so this can take
+// a second or two.
+$('snap').onclick=function(){stopFocus();pauseLive();
+  $('vmsg').textContent='taking a full-size snapshot…';
   var v=$('view');v.onload=function(){v.className='shown';$('vmsg').textContent=''};
   v.onerror=function(){$('vmsg').textContent='snapshot failed'};
   v.src='/snapshot?'+Date.now()}
 
+// Focus view: back-to-back full-size snapshots, the centre drawn at one
+// sensor pixel per device pixel (so CSS size = pixels / devicePixelRatio),
+// and each JPEG's size as a crude sharpness meter.
+$('focus').onclick=function(){if(focusing){stopFocus();return}
+  pauseLive();focusing=true;peak=0;this.className='on';$('fcard').hidden=false;
+  $('vmsg').textContent='focus view below';focusLoop()}
+$('freset').onclick=function(){peak=0;$('fpeak').textContent=''}
+function focusLoop(){if(!focusing)return;
+  fetch('/snapshot?'+Date.now(),{cache:'no-store'}).then(function(r){return r.blob()})
+  .then(function(b){if(!focusing)return;if(!b.size)throw 0;
+    if(b.size>peak)peak=b.size;
+    $('fsize').textContent=kb1(b.size);$('fpeak').textContent='peak '+kb1(peak);
+    var u=URL.createObjectURL(b),im=new Image();
+    im.onload=function(){URL.revokeObjectURL(u);drawCentre(im);setTimeout(focusLoop,0)};
+    im.onerror=function(){URL.revokeObjectURL(u);setTimeout(focusLoop,500)};
+    im.src=u})
+  .catch(function(){$('fsub').textContent='snapshot failed, retrying…';
+    setTimeout(focusLoop,1000)})}
+function drawCentre(im){
+  var c=$('fcv'),dpr=window.devicePixelRatio||1,box=c.parentNode.clientWidth;
+  var w=Math.min(Math.round(box*dpr),im.naturalWidth),
+      h=Math.min(Math.round(box*dpr*3/4),im.naturalHeight);
+  c.width=w;c.height=h;c.style.width=(w/dpr)+'px';c.style.height=(h/dpr)+'px';
+  var x=c.getContext('2d');x.imageSmoothingEnabled=false;
+  x.drawImage(im,(im.naturalWidth-w)>>1,(im.naturalHeight-h)>>1,w,h,0,0,w,h);
+  $('fsub').textContent='centre '+w+'×'+h+' of '+im.naturalWidth+'×'+
+    im.naturalHeight+', 1:1'}
+
+// Cold capture: the loop task cuts the rail, then runs the PIR wake's photo
+// path. The result arrives as a new seq on GET /coldtest.
+function coldRows(a){$('cold').innerHTML=a.map(function(r){
+  return'<div>'+r[0]+'</div><div>'+r[1]+'</div>'}).join('')}
+$('coldbtn').onclick=function(){stopFocus();pauseLive();
+  $('vmsg').textContent='cold capture running…';
+  coldRows([['Result','running: rail off, then a cold start…']]);
+  fetch('/coldtest',{method:'POST'}).then(function(r){return r.json()})
+    .then(function(j){coldPoll(j.seq)})
+    .catch(function(){coldRows([['Result','request failed']])})}
+function coldPoll(seq){fetch('/coldtest',{cache:'no-store'})
+  .then(function(r){return r.json()})
+  .then(function(d){if(d.running||d.seq<=seq){
+    setTimeout(function(){coldPoll(seq)},500);return}coldShow(d)})
+  .catch(function(){setTimeout(function(){coldPoll(seq)},1000)})}
+function coldShow(d){
+  if(d.busy){coldRows([['Result','camera busy; close other previews and retry']]);return}
+  if(!d.ok){$('vmsg').textContent='cold capture failed';
+    coldRows([['Result','FAILED: no frame (see the serial log)'],
+      ['Capture',d.cap_ms+' ms']]);return}
+  var det=d.det=='off'?'no detector in this build':
+    d.det=='error'?'ERROR: could not judge (sent unjudged in the field)':
+    (d.det=='hit'?'PERSON, score ':'no person, best ')+d.score.toFixed(2);
+  var r=[['Result','captured'],
+    ['Wake-to-shutter',d.w2s+' ms from rail on (a PIR wake adds its boot)'],
+    ['Capture',d.cap_ms+' ms, rail on to rail off'],
+    ['JPEG',kb1(d.len)+' · quality '+d.q],['Detection',det]];
+  if(d.det!='off'&&d.det!='error'||d.dec_ms)
+    r.push(['Detect time','decode '+d.dec_ms+' ms · inference '+d.inf_ms+' ms']);
+  if(d.det!='off')r.push(['Model load',d.load_ms+' ms']);
+  r.push(['Image','<a href="/coldtest.jpg?'+d.seq+'" target="_blank">open full size</a>']);
+  coldRows(r);
+  var v=$('view');v.onload=function(){v.className='shown';$('vmsg').textContent=''};
+  v.onerror=function(){$('vmsg').textContent='could not load the capture'};
+  v.src='/coldtest.jpg?'+d.seq}
+
 function act(path,label,confirmText){
   if(!confirm(confirmText))return;
-  live=false;$('live').className='';stopStream();
+  stopFocus();pauseLive();
   fetch(path,{method:'POST'}).then(function(){toast(label)})
     .catch(function(){toast(label)})}
 $('arm').onclick=function(){act('/arm','Arming — node will sleep',
@@ -410,7 +623,10 @@ function render(d){
   rows=[];
   row('Uptime',dur(d.uptime));
   row('Battery',d.vbat_mv<0?'no divider fitted':(d.vbat_mv/1000).toFixed(2)+' V');
-  row('Camera',d.cam?'on'+(d.cam_users?' · streaming':''):'powered down');
+  row('Camera',d.cam?d.cam_mode+(d.cam_users?' · streaming':''):'powered down');
+  row('Still',d.still_w+'×'+d.still_h+' · quality '+d.q);
+  row('Preview',d.prev_w+'×'+d.prev_h);
+  row('Orientation','v-flip '+(d.vflip?'on':'off')+' · mirror '+(d.hmirror?'on':'off'));
   row('Last frame',d.frames?kb(d.frame_len)+' · '+d.frames+' served':'—');
   row('Triggers',d.trig_total+' total · '+d.trig_since+' unreported');
   row('Suppressed',d.supp_total+' total · '+d.supp_since+' unreported');
@@ -425,9 +641,13 @@ function render(d){
   row('Free PSRAM',kb(d.psram_free)+' / '+kb(d.psram_size));
   $('stat').innerHTML=rows.join('');
 
-  if(d.cam&&live&&!streaming)startStream();
-  if(!d.cam&&streaming)stopStream();
-  if(!d.cam&&!streaming&&live)$('vmsg').textContent='camera warming up…';
+  // Only a request brings a powered-down sensor back (DEPLOY_CAM_IDLE_MS),
+  // so a live view with the camera down asks for it rather than waiting.
+  if(d.cam_mode=='preview'&&live&&!streaming)startStream();
+  if(d.cam_mode!='preview'&&streaming)stopStream();
+  if(d.cam_mode!='preview'&&!streaming&&live){
+    if(!d.cam)fetch('/wake',{method:'POST'});
+    $('vmsg').textContent=d.cam?'switching to preview…':'camera warming up…'}
 }
 
 function poll(){
@@ -457,39 +677,127 @@ static void install_routes()
 		req->send(res);
 	});
 
-	// One frame, with a real Content-Length so the browser can cache-bust it
-	// and show a still while the aim is checked.
+	// One full-size still (CAM_FRAMESIZE), for the aim check and the focus
+	// view. The loop task takes it (service_still()); this response only
+	// waits for it. The length is unknown when the headers go out, so it is
+	// chunked, and the filler answers RESPONSE_TRY_AGAIN, which AsyncTCP's
+	// poll re-asks about twice a second, until the frame is there. A failure
+	// or DEPLOY_STILL_WAIT_MS without one ends it empty, which the page
+	// treats as a failed snapshot.
 	g_server.on("/snapshot", HTTP_GET, [](AsyncWebServerRequest *req) {
-		if (!cam_use_begin()) {
-			req->send(503, "text/plain", "camera down");
-			return;
-		}
-		camera_fb_t *fb = esp_camera_fb_get();
-		if (!fb) {
-			cam_use_end();
-			req->send(503, "text/plain", "capture failed");
-			return;
-		}
-		g_frames_served++;
-		g_last_frame_len = fb->len;
-
-		std::shared_ptr<jpeg_feed_t> st(new (std::nothrow) jpeg_feed_t());
+		struct snap_t {
+			uint32_t want;
+			uint32_t t0;
+			blob_ref blob;
+			size_t   cursor = 0;
+			bool     done   = false;
+		};
+		std::shared_ptr<snap_t> st(new (std::nothrow) snap_t());
 		if (!st) {
-			esp_camera_fb_return(fb);
-			cam_use_end();
 			req->send(503, "text/plain", "out of memory");
 			return;
 		}
-		st->fb = fb;
-		const size_t len = fb->len;
+		st->t0 = millis();
+		xSemaphoreTake(g_cam_lock, portMAX_DELAY);
+		g_cam_request_ms = g_full_request_ms = g_still_req_ms = st->t0;
+		st->want = ++g_still_want;
+		xSemaphoreGive(g_cam_lock);
 
-		AsyncWebServerResponse *res = req->beginResponse(
-		    "image/jpeg", len,
+		AsyncWebServerResponse *res = req->beginChunkedResponse(
+		    "image/jpeg",
 		    [st](uint8_t *buf, size_t maxLen, size_t) -> size_t {
-			    return jpeg_feed_fill(st, buf, maxLen);
+			    if (st->done) {
+				    return 0;
+			    }
+			    if (!st->blob) {
+				    xSemaphoreTake(g_cam_lock, portMAX_DELAY);
+				    const bool answered = (int32_t)(g_still_done - st->want) >= 0;
+				    const bool failed   = g_still_failed;
+				    blob_ref   blob     = g_still;
+				    if (!answered) {
+					    // Still wanted: keep the sensor at full size.
+					    g_cam_request_ms = g_full_request_ms = millis();
+				    }
+				    xSemaphoreGive(g_cam_lock);
+				    if (!answered) {
+					    if (millis() - st->t0 > (uint32_t)DEPLOY_STILL_WAIT_MS) {
+						    st->done = true;
+						    return 0;
+					    }
+					    return RESPONSE_TRY_AGAIN;
+				    }
+				    if (failed || !blob) {
+					    st->done = true;
+					    return 0;
+				    }
+				    st->blob = blob;
+			    }
+			    const size_t left = st->blob->len - st->cursor;
+			    const size_t n    = left < maxLen ? left : maxLen;
+			    memcpy(buf, st->blob->data + st->cursor, n);
+			    st->cursor += n;
+			    if (n == 0) {
+				    st->done = true;
+			    }
+			    return n;
 		    });
 		res->addHeader("Cache-Control", "no-store");
 		req->send(res);
+	});
+
+	// The last cold-capture test's JPEG, with a real Content-Length.
+	g_server.on("/coldtest.jpg", HTTP_GET, [](AsyncWebServerRequest *req) {
+		xSemaphoreTake(g_cam_lock, portMAX_DELAY);
+		blob_ref blob = g_cold_jpeg;
+		xSemaphoreGive(g_cam_lock);
+		if (!blob) {
+			req->send(404, "text/plain", "no cold capture yet");
+			return;
+		}
+		AsyncWebServerResponse *res = req->beginResponse(
+		    "image/jpeg", blob->len,
+		    [blob](uint8_t *buf, size_t maxLen, size_t index) -> size_t {
+			    const size_t left = blob->len - index;
+			    const size_t n    = left < maxLen ? left : maxLen;
+			    memcpy(buf, blob->data + index, n);
+			    return n;
+		    });
+		res->addHeader("Cache-Control", "no-store");
+		req->send(res);
+	});
+
+	// Start a cold-capture test. It runs on the loop task (service_coldtest()),
+	// since it cycles camera power. The reply carries the result count so far;
+	// the page polls GET /coldtest until it moves.
+	g_server.on("/coldtest", HTTP_POST, [](AsyncWebServerRequest *req) {
+		xSemaphoreTake(g_cam_lock, portMAX_DELAY);
+		const uint32_t seq  = g_cold_seq;
+		const bool     busy = g_cold_running || g_cold_req;
+		xSemaphoreGive(g_cam_lock);
+		if (!busy) {
+			g_cold_req_ms = millis();
+			g_cold_req    = true;
+		}
+		String j = "{\"seq\":";
+		j += seq;
+		j += "}";
+		req->send(202, "application/json", j);
+	});
+
+	g_server.on("/coldtest", HTTP_GET, [](AsyncWebServerRequest *req) {
+		AsyncWebServerResponse *res =
+		    req->beginResponse(200, "application/json", cold_json());
+		res->addHeader("Cache-Control", "no-store");
+		req->send(res);
+	});
+
+	// The page asks for the preview here when it finds the sensor powered
+	// down: only a request brings it back (DEPLOY_CAM_IDLE_MS).
+	g_server.on("/wake", HTTP_POST, [](AsyncWebServerRequest *req) {
+		xSemaphoreTake(g_cam_lock, portMAX_DELAY);
+		g_cam_request_ms = millis();
+		xSemaphoreGive(g_cam_lock);
+		req->send(204);
 	});
 
 	// Live MJPEG. One at a time: a second stream would halve the frame rate of
@@ -500,7 +808,7 @@ static void install_routes()
 			return;
 		}
 		if (!cam_use_begin()) {
-			req->send(503, "text/plain", "camera down");
+			req->send(503, "text/plain", "preview not ready");
 			return;
 		}
 		std::shared_ptr<jpeg_feed_t> st(new (std::nothrow) jpeg_feed_t());
@@ -509,7 +817,6 @@ static void install_routes()
 			req->send(503, "text/plain", "out of memory");
 			return;
 		}
-		st->multipart = true;
 		g_stream_open = true;
 
 		AsyncWebServerResponse *res = req->beginChunkedResponse(
@@ -545,6 +852,29 @@ static void install_routes()
 // ---------------------------------------------------------------------------
 // Entry
 // ---------------------------------------------------------------------------
+
+// Power the sensor up in `mode`. Loop task only. camera_up() initialises it
+// at CAM_FRAMESIZE, so the frame buffers fit a full still, and the preview is
+// then a resize down (config.h, DEPLOY_PREVIEW_FRAMESIZE).
+static bool cam_bring_up(cam_mode_t mode)
+{
+	if (!camera_up()) {
+		return false;
+	}
+	sensor_t *s = esp_camera_sensor_get();
+	xSemaphoreTake(g_cam_lock, portMAX_DELAY);
+	g_full_size = s->status.framesize;
+	xSemaphoreGive(g_cam_lock);
+	if (mode == CAM_PREVIEW && s->set_framesize(s, DEPLOY_PREVIEW_FRAMESIZE) != 0) {
+		camera_down();
+		return false;
+	}
+	// A cold sensor: no still until exposure has had the capture path's own
+	// warm-up (config.h, CAM_WARMUP_MS).
+	g_settle_until = millis() + CAM_WARMUP_MS;
+	return true;
+}
+
 void deploy_mode_begin()
 {
 	g_cam_lock = xSemaphoreCreateMutex();
@@ -552,9 +882,10 @@ void deploy_mode_begin()
 	// Bring the sensor up before the first request arrives, so the page has a
 	// picture by the time it has finished loading. This also starts the idle
 	// timer that powers it back down if nobody looks.
-	g_cam_on         = camera_up();
+	const bool cam_ok = cam_bring_up(CAM_PREVIEW);
+	g_cam_mode       = cam_ok ? CAM_PREVIEW : CAM_OFF;
 	g_cam_request_ms = millis();
-	if (!g_cam_on) {
+	if (!cam_ok) {
 		log_e("deployment mode: camera failed to start; UI will retry");
 	}
 
@@ -586,36 +917,168 @@ void deploy_mode_begin()
 }
 
 // ---------------------------------------------------------------------------
-// Service tick — owns camera power, the PIR walk test and deferred actions.
+// Service tick — owns camera power and size, stills, the cold-capture test,
+// the PIR walk test and deferred actions.
 // ---------------------------------------------------------------------------
 static void service_camera()
 {
 	xSemaphoreTake(g_cam_lock, portMAX_DELAY);
-	const bool idle = (millis() - g_cam_request_ms) >= (uint32_t)DEPLOY_CAM_IDLE_MS;
+	const uint32_t   now  = millis();
+	const bool       idle = (now - g_cam_request_ms) >= (uint32_t)DEPLOY_CAM_IDLE_MS;
+	const cam_mode_t on   = (now - g_full_request_ms) < (uint32_t)DEPLOY_FULL_HOLD_MS
+	                            ? CAM_FULL : CAM_PREVIEW;
+	const cam_mode_t from = g_cam_mode;
+	cam_mode_t to = from;
 	// Deciding and publishing under one lock is the whole point: cam_use_begin()
-	// takes its use against g_cam_on in the same critical section, so a handler
-	// can never be mid-frame when we decide to tear the sensor down.
-	const bool down = g_cam_on && g_cam_users == 0 && idle;
-	if (down) {
-		g_cam_on = false;
+	// takes its use against g_cam_mode in the same critical section, so a
+	// handler can never be mid-frame when the sensor is resized or torn down.
+	if (from != CAM_OFF) {
+		if (g_cam_users == 0) {
+			to = idle ? CAM_OFF : on;
+		}
+	} else if (!idle && (int32_t)(now - g_cam_retry_at) >= 0) {
+		to = on;
 	}
-	const bool up = !g_cam_on && !down && !idle;
+	if (to != from) {
+		g_cam_mode = CAM_SWITCHING;
+	}
 	xSemaphoreGive(g_cam_lock);
+	if (to == from) {
+		return;
+	}
 
-	if (down) {
+	cam_mode_t result = to;
+	if (to == CAM_OFF) {
 		camera_down();
-		log_i("preview idle for %d ms, camera powered down", DEPLOY_CAM_IDLE_MS);
-	} else if (up && (int32_t)(millis() - g_cam_retry_at) >= 0) {
-		const bool ok = camera_up();
-		xSemaphoreTake(g_cam_lock, portMAX_DELAY);
-		g_cam_on = ok;
-		xSemaphoreGive(g_cam_lock);
-		if (!ok) {
+		log_i("camera idle for %d ms, powered down", DEPLOY_CAM_IDLE_MS);
+	} else if (from == CAM_OFF) {
+		if (!cam_bring_up(to)) {
+			result = CAM_OFF;
 			g_cam_retry_at = millis() + DEPLOY_CAM_RETRY_MS;
 			log_e("camera failed to come back up, retrying in %d ms",
 			      DEPLOY_CAM_RETRY_MS);
 		}
+	} else {
+		// A resize on a running sensor, within the buffers sized at init.
+		sensor_t *s = esp_camera_sensor_get();
+		const framesize_t size = to == CAM_FULL ? g_full_size : DEPLOY_PREVIEW_FRAMESIZE;
+		if (s && s->set_framesize(s, size) == 0) {
+			g_settle_until = millis() + DEPLOY_SWITCH_SETTLE_MS;
+		} else {
+			camera_down();
+			result = CAM_OFF;
+			g_cam_retry_at = millis() + DEPLOY_CAM_RETRY_MS;
+			log_e("camera resize failed; powered down, retrying in %d ms",
+			      DEPLOY_CAM_RETRY_MS);
+		}
 	}
+	xSemaphoreTake(g_cam_lock, portMAX_DELAY);
+	g_cam_mode = result;
+	xSemaphoreGive(g_cam_lock);
+}
+
+// Answer the /snapshot requests made so far with one full-size frame, from a
+// frame that started after the newest of them and after the sensor settled.
+// Blocks this task for up to a frame time per tick while one is pending.
+static void service_still()
+{
+	xSemaphoreTake(g_cam_lock, portMAX_DELAY);
+	const uint32_t want    = g_still_want;
+	const uint32_t req_ms  = g_still_req_ms;
+	const bool     pending = want != g_still_done;
+	const bool     ready   = g_cam_mode == CAM_FULL;
+	xSemaphoreGive(g_cam_lock);
+	if (!pending || !ready) {
+		return;
+	}
+
+	camera_fb_t *fb = esp_camera_fb_get();
+	blob_ref still;
+	if (fb) {
+		const uint32_t t = fb_start_ms(fb);
+		if ((int32_t)(t - req_ms) < 0 || (int32_t)(t - g_settle_until) < 0) {
+			esp_camera_fb_return(fb);
+			return;   // too early; the next tick takes a newer one
+		}
+		still = blob_copy(fb->buf, fb->len);
+		esp_camera_fb_return(fb);
+	}
+	if (!still) {
+		log_w("full-size still failed (%s)", fb ? "no PSRAM for the copy" : "no frame");
+	}
+
+	xSemaphoreTake(g_cam_lock, portMAX_DELAY);
+	if (still) {
+		g_still = still;
+		g_frames_served++;
+		g_last_frame_len = still->len;
+	}
+	g_still_done   = want;
+	g_still_failed = !still;
+	xSemaphoreGive(g_cam_lock);
+}
+
+// The cold-capture test: rail off for DEPLOY_COLDTEST_OFF_MS, then the PIR
+// wake's photo path (deploy_cold_test() in main.cpp). Blocks this task for
+// the few seconds it takes; the captive DNS and the PIR walk test wait.
+static void service_coldtest()
+{
+	if (!g_cold_req) {
+		return;
+	}
+
+	xSemaphoreTake(g_cam_lock, portMAX_DELAY);
+	const bool       free = g_cam_users == 0;
+	const cam_mode_t from = g_cam_mode;
+	if (free) {
+		g_cam_mode     = CAM_SWITCHING;
+		g_cold_running = true;
+	}
+	xSemaphoreGive(g_cam_lock);
+
+	if (!free) {
+		// The page stops its stream first, so this is a response the async
+		// task has not torn down yet. Give it the same second as shutdown.
+		if (millis() - g_cold_req_ms < SHUTDOWN_DRAIN_TICKS * SERVICE_TICK_MS) {
+			return;
+		}
+		g_cold_req = false;
+		xSemaphoreTake(g_cam_lock, portMAX_DELAY);
+		g_cold      = {};
+		g_cold_busy = true;
+		g_cold_jpeg.reset();
+		g_cold_seq++;
+		xSemaphoreGive(g_cam_lock);
+		log_w("cold-capture test refused: a stream still holds the camera");
+		return;
+	}
+	g_cold_req = false;
+
+	if (from != CAM_OFF) {
+		camera_down();
+	}
+	delay(DEPLOY_COLDTEST_OFF_MS);
+	log_i("cold-capture test: rail off for %d ms, running the photo path",
+	      DEPLOY_COLDTEST_OFF_MS);
+
+	cold_test_t r;
+	deploy_cold_test(&r);
+	blob_ref jpeg;
+	if (r.jpeg) {
+		jpeg = blob_adopt(r.jpeg, r.jpeg_len);
+		r.jpeg = nullptr;
+	}
+
+	// capture() has cut the rail again; service_camera() brings the preview
+	// back if anything still wants it.
+	xSemaphoreTake(g_cam_lock, portMAX_DELAY);
+	g_cold         = r;
+	g_cold_busy    = false;
+	g_cold_jpeg    = jpeg;
+	g_cold_seq++;
+	g_cold_running = false;
+	g_cam_mode     = CAM_OFF;
+	xSemaphoreGive(g_cam_lock);
 }
 
 static void service_pir()
@@ -656,8 +1119,8 @@ static void service_action()
 	}
 
 	xSemaphoreTake(g_cam_lock, portMAX_DELAY);
-	const bool was_on = g_cam_on;
-	g_cam_on = false;
+	const bool was_on = g_cam_mode != CAM_OFF;
+	g_cam_mode = CAM_OFF;
 	xSemaphoreGive(g_cam_lock);
 
 	if (was_on && drained) {
@@ -685,7 +1148,9 @@ void deploy_mode_service()
 	g_dns.processNextRequest();
 #endif
 	service_pir();
+	service_coldtest();
 	service_camera();
+	service_still();
 	service_action();
 	delay(SERVICE_TICK_MS);
 }

@@ -492,3 +492,27 @@
 // Back-off after a failed esp_camera_init(). Without it a sensor that will not
 // start gets re-initialised — and its rail cycled — every service tick.
 #define DEPLOY_CAM_RETRY_MS   2000
+
+// Live preview size. Stills (/snapshot, the focus view, the cold-capture test)
+// are CAM_FRAMESIZE. The sensor is initialised at CAM_FRAMESIZE and dropped to
+// this size for streaming, because esp32-camera sizes its frame buffers once,
+// at init: the sensor can switch below the init size on the fly but never
+// above it. Must not be larger than CAM_FRAMESIZE.
+#define DEPLOY_PREVIEW_FRAMESIZE  FRAMESIZE_VGA
+
+// How long the sensor stays at full size after the last still request, so the
+// focus view's back-to-back snapshots do not bounce it between sizes.
+#define DEPLOY_FULL_HOLD_MS       3000
+
+// After a size switch the first frame is partial and exposure is adapting to
+// the new line timing; a still is never taken from a frame that started
+// sooner than this after the switch.
+#define DEPLOY_SWITCH_SETTLE_MS   500
+
+// How long /snapshot waits for the loop task to produce a full-size still.
+#define DEPLOY_STILL_WAIT_MS      15000
+
+// Cold-capture test: the rail is held off this long before the test powers
+// it back up, so the sensor and its decoupling genuinely lose power, as they
+// do between PIR wakes (9.1 step 3).
+#define DEPLOY_COLDTEST_OFF_MS    1000

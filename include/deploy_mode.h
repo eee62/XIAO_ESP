@@ -10,6 +10,7 @@
 // halves meet only through the small surface below.
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 // ---------------------------------------------------------------------------
@@ -42,9 +43,36 @@ struct deploy_status_t {
 	// because it is otherwise invisible in the field, and it is the single
 	// most useful thing to know when a sited node has stopped reporting.
 	bool     using_dhcp;
+	// JPEG quality number the next still starts at (config.h,
+	// CAM_QUALITY_STEP): CAM_JPEG_QUALITY unless a frame has overflowed.
+	uint8_t  cam_quality;
 };
 
 void deploy_fill_status(deploy_status_t *out);
+
+// The PIR wake's photo path on demand, for the cold-capture test: capture()
+// from a dead rail (power on, cold init, warm-up, one frame, rail off), then
+// detection on that frame. Loop task only, with the camera already down.
+enum {
+	COLD_DETECT_OFF = 0,   // no detector in this build (bench-nodetect)
+	COLD_DETECT_NONE,      // judged, no person
+	COLD_DETECT_HIT,       // person at or above DETECT_SCORE_THRESHOLD
+	COLD_DETECT_ERROR,     // could not judge (decode or model allocation)
+};
+struct cold_test_t {
+	bool     ok;                   // a frame was captured
+	uint32_t wake_to_shutter_ms;   // rail on to the kept frame's start
+	uint32_t capture_ms;           // rail on to rail off
+	uint8_t *jpeg;                 // PSRAM; the caller frees it (heap_caps_free)
+	size_t   jpeg_len;
+	int      quality;
+	int      detect;               // COLD_DETECT_*
+	float    score;
+	uint32_t load_ms;              // detector construction and model load
+	uint32_t decode_ms;
+	uint32_t infer_ms;
+};
+void deploy_cold_test(cold_test_t *out);
 
 // ---------------------------------------------------------------------------
 // Provided by deploy_mode.cpp.
