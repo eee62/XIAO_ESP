@@ -325,15 +325,20 @@
 // long-visit rule chains the next. Lower VIDEO_FPS or VIDEO_FRAMESIZE VGA
 // stretch it.
 //
-// Energy per clip, from the ~250 mA active figure in 7 (bench to confirm):
+// Energy per clip, from the ~250 mA active figure in 7 (bench to confirm;
+// recording has the radio off, so 250 mA likely overstates that part):
 //   camera init and warm-up, ~1 s                          ~0.07 mAh
 //   recording, up to VIDEO_MAX_CLIP_S                      ~2.1 mAh at 30 s
 //   association, TLS, a 4 MB upload at ~200 kB/s (~24 s)   ~1.7 mAh
-//   total                                                  ~3.9 mAh
-// At the TELEGRAM_MIN_BPS floor the upload alone is ~18 mAh. The daily cap
-// is what bounds this: VIDEO_MAX_CLIPS_PER_DAY 6 is ~23 mAh on a day that
-// reaches it, 2.6 times 7's whole ~9 mAh/day budget (8.2 of which is sleep).
-// A node that hit the cap every day would last ~3.5 months, not ~a year.
+//   total                                                  ~3.8 mAh
+// At the TELEGRAM_MIN_BPS floor the upload alone is ~18.5 mAh, ~20.6 mAh a
+// clip. The daily cap is what bounds this. VIDEO_MAX_CLIPS_PER_DAY 3 is
+// ~11.5 mAh on a day that reaches it (~62 mAh if every upload crawled at the
+// floor). That does NOT fit 7's ~9 mAh/day: 8.2 mAh of that is sleep, which
+// leaves ~0.8 mAh/day for everything else, less than one clip. No cap of one
+// or more fits. A node that hit this cap every day would draw ~20 mAh/day
+// and last ~5.5 months instead of ~a year; clips on only a few days a week
+// keep the average near budget.
 // ---------------------------------------------------------------------------
 #define VIDEO_ENABLED                1
 #define VIDEO_PRESENCE_MIN_S         10
@@ -354,8 +359,9 @@
 // (CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP).
 #define VIDEO_PSRAM_RESERVE          (512 * 1024)
 #define VIDEO_MAX_CLIPS_PER_EPISODE  3
-// In any rolling 24 hours, by now_s(); counted when a clip starts recording.
-#define VIDEO_MAX_CLIPS_PER_DAY      6
+// In any rolling 24 hours, by now_s(); a clip counts, by its start time, once
+// it has actually been recorded. See the energy note above.
+#define VIDEO_MAX_CLIPS_PER_DAY      3
 
 // bench-nodetect has no detector to confirm a person with.
 #if !DETECTION_ENABLED
