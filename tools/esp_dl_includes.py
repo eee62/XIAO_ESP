@@ -42,6 +42,11 @@ esp_dl_subdirs = [
 
 includes = [os.path.join(esp_dl, d) for d in esp_dl_subdirs]
 
+# esp_new_jpeg, the decoder behind esp-dl's sw_decode_jpeg(). main.cpp calls
+# it directly for its scaled decode, which sw_decode_jpeg() does not offer.
+# It is esp-dl's own dependency, so it is fetched whenever esp-dl is.
+includes.append(os.path.join(managed, "espressif__esp_new_jpeg", "include"))
+
 # Model components keep their header at the component root.
 for model in ("espressif__pedestrian_detect", "espressif__human_face_detect"):
     includes.append(os.path.join(managed, model))

@@ -31,6 +31,8 @@ struct deploy_status_t {
 	uint32_t triggers_since_report;
 	uint32_t suppressed_total;
 	uint32_t suppressed_since_report;
+	uint32_t detect_errors_total;         // frames detection could not judge
+	uint32_t detect_errors_since_report;
 	uint32_t last_report_s;
 	bool     have_ap_cache;
 	uint8_t  ap_channel;

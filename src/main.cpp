@@ -40,7 +40,8 @@
 #include "telegram.h"
 
 #if DETECTION_ENABLED
-#include "dl_image_jpeg.hpp"
+#include "dl_image_define.hpp"
+#include "esp_jpeg_dec.h"
 #if DETECT_MODEL == DETECT_MODEL_PEDESTRIAN
 #include "pedestrian_detect.hpp"
 #else
@@ -96,6 +97,11 @@ RTC_DATA_ATTR static uint32_t rtc_triggers_total = 0;
 RTC_DATA_ATTR static uint32_t rtc_triggers_since_report = 0;
 RTC_DATA_ATTR static uint32_t rtc_suppressed_since_report = 0;
 RTC_DATA_ATTR static uint32_t rtc_suppressed_total = 0;
+// Frames the detector could not judge (decode or allocation failure). Kept
+// apart from "suppressed", which means judged and found empty: these are sent
+// unfiltered instead (detect_over_buffer()).
+RTC_DATA_ATTR static uint32_t rtc_detect_errors_total = 0;
+RTC_DATA_ATTR static uint32_t rtc_detect_errors_since_report = 0;
 RTC_DATA_ATTR static uint32_t rtc_last_report_s = 0;
 
 // When a telemetry-carrying transmission was last *attempted*, delivered or
@@ -144,6 +150,7 @@ struct frame_t {
 	uint32_t ts;
 	float    score;
 	bool     hit;
+	bool     err;    // detection could not run on it; sent unjudged
 };
 
 static frame_t g_burst[BURST_MAX_FRAMES];
@@ -400,6 +407,7 @@ static bool capture(frame_t *out, uint32_t t_ref_ms)
 			out->ts    = now_s();
 			out->score = 0.0f;
 			out->hit   = false;
+			out->err   = false;
 			ok = true;
 		} else {
 			log_e("PSRAM alloc failed for %u byte frame", (unsigned)fb->len);
@@ -450,18 +458,101 @@ typedef HumanFaceDetect  detector_t;
 static const char *DETECT_MODEL_NAME = "face";
 #endif
 
-// Returns the number of buffered frames containing a human, and tags each
-// frame with its best score.
+// Decode one buffered JPEG to RGB888 for the detector, at the smallest
+// power-of-two reduction that brings its width to DETECT_DECODE_MAX_W or less
+// (config.h). The caller frees img.data with heap_caps_free(); on any failure
+// it is nullptr.
 //
-// `on_first_hit` is invoked the moment the first frame scores, and is how the
-// radio gets started early without being started speculatively. The alternative
-// — associating before detection runs — would light the radio for every burst,
-// and the whole premise of 9.2 is that most bursts are wind in a branch and
-// resolve to nothing. Firing on the first hit means the association overlaps
-// the remaining frames exactly when there is going to be something to send,
-// and never runs at all on a burst that gets suppressed.
-static int detect_over_buffer(void (*on_first_hit)())
+// esp_new_jpeg is called directly because esp-dl 3.3.12's sw_decode_jpeg()
+// is a thin wrapper over it that always opens the decoder with scale {0, 0}:
+// it can only decode at full size. The decoder itself takes an output scale in
+// its open-time config (multiples of 8, down to 1/8). The other candidate,
+// esp32-camera's jpg2rgb565() with a jpg_scale_t, goes through the prebuilt
+// esp_jpeg (tjpgd) with no byte-swap option set, and its RGB565 byte order
+// cannot be checked against esp-dl's RGB565LE/BE types from the installed
+// sources; RGB888 also saves the detector a colour conversion.
+//
+// The result needs no further resizing here: the model's ImagePreprocessor
+// warps any RGB888 img_t to its input tensor's size, and the postprocessor
+// scales boxes back to the img_t it was given.
+static dl::image::img_t decode_for_detect(const frame_t &f)
 {
+	dl::image::img_t img = {};
+	img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB888;
+
+	// The scale is fixed when the decoder is opened, so the source size has
+	// to come from a first, unscaled open.
+	jpeg_dec_config_t cfg = DEFAULT_JPEG_DEC_CONFIG();   // RGB888, no scale
+	jpeg_dec_handle_t dec = nullptr;
+	jpeg_dec_io_t io = {};
+	jpeg_dec_header_info_t info = {};
+	io.inbuf     = f.data;
+	io.inbuf_len = (int)f.len;
+	if (jpeg_dec_open(&cfg, &dec) != JPEG_ERR_OK) {
+		return img;
+	}
+	const jpeg_error_t herr = jpeg_dec_parse_header(dec, &io, &info);
+	jpeg_dec_close(dec);
+	if (herr != JPEG_ERR_OK) {
+		return img;
+	}
+
+	int shift = 0;
+	while (shift < 3 && (info.width >> shift) > DETECT_DECODE_MAX_W) {
+		shift++;
+	}
+	uint16_t w = info.width, h = info.height;
+	if (shift > 0) {
+		w = (info.width >> shift) & ~7u;
+		h = (info.height >> shift) & ~7u;
+		cfg.scale.width  = w;
+		cfg.scale.height = h;
+	}
+
+	io = {};
+	io.inbuf     = f.data;
+	io.inbuf_len = (int)f.len;
+	if (jpeg_dec_open(&cfg, &dec) != JPEG_ERR_OK) {
+		return img;
+	}
+	int out_len = 0;
+	if (jpeg_dec_parse_header(dec, &io, &info) == JPEG_ERR_OK &&
+	    jpeg_dec_get_outbuf_len(dec, &out_len) == JPEG_ERR_OK &&
+	    out_len >= (int)w * h * 3) {
+		// 16-byte aligned, as jpeg_dec_process() requires on the S3. Sized
+		// by the decoder's own figure, which may round up past w x h x 3.
+		void *buf = heap_caps_aligned_alloc(16, out_len, MALLOC_CAP_SPIRAM);
+		if (buf) {
+			io.outbuf = (uint8_t *)buf;
+			if (jpeg_dec_process(dec, &io) == JPEG_ERR_OK) {
+				img.data   = buf;
+				img.width  = w;
+				img.height = h;
+			} else {
+				heap_caps_free(buf);
+			}
+		}
+	}
+	jpeg_dec_close(dec);
+	return img;
+}
+
+// Returns the number of buffered frames containing a human, and tags each
+// frame with its best score. Frames the detector could not judge are flagged
+// `err` and counted in *errors instead: they are neither hits nor
+// suppressions, and the caller sends them unfiltered.
+//
+// `on_first_hit` is invoked the moment the first frame is known to be going
+// out, a hit or an error, and is how the radio gets started early without
+// being started speculatively. The alternative — associating before
+// detection runs — would light the radio for every burst, and the whole
+// premise of 9.2 is that most bursts are wind in a branch and resolve to
+// nothing. Firing on the first frame out means the association overlaps the
+// remaining frames exactly when there is going to be something to send, and
+// never runs at all on a burst that gets suppressed.
+static int detect_over_buffer(void (*on_first_hit)(), int *errors)
+{
+	*errors = 0;
 	if (g_burst_n == 0) {
 		return 0;
 	}
@@ -473,12 +564,13 @@ static int detect_over_buffer(void (*on_first_hit)())
 		// is better sent than silently dropped.
 		log_e("detector alloc failed, sending burst unfiltered");
 		for (int i = 0; i < g_burst_n; i++) {
-			g_burst[i].hit = true;
+			g_burst[i].err = true;
 		}
 		if (on_first_hit) {
 			on_first_hit();
 		}
-		return g_burst_n;
+		*errors = g_burst_n;
+		return 0;
 	}
 
 	// Push the configured threshold into the model's own postprocessor (9.2:
@@ -494,42 +586,51 @@ static int detect_over_buffer(void (*on_first_hit)())
 
 	int hits = 0;
 	for (int i = 0; i < g_burst_n; i++) {
-		dl::image::jpeg_img_t jpeg = {
-			.data     = (void *)g_burst[i].data,
-			.data_len = g_burst[i].len,
-		};
-		dl::image::img_t img = dl::image::sw_decode_jpeg(
-			jpeg, dl::image::DL_IMAGE_PIX_TYPE_RGB888);
+		frame_t &f = g_burst[i];
+		const uint32_t t_dec = millis();
+		dl::image::img_t img = decode_for_detect(f);
+		const uint32_t dec_ms = millis() - t_dec;
 		if (!img.data) {
-			log_w("frame %d: jpeg decode failed", i);
+			// Fail open, as for the model allocation above.
+			log_w("frame %d: jpeg decode failed after %lu ms; sending unjudged",
+			      i, (unsigned long)dec_ms);
+			f.err = true;
+			(*errors)++;
+			if (hits + *errors == 1 && on_first_hit) {
+				on_first_hit();
+			}
 			continue;
 		}
 
+		const uint32_t t_inf = millis();
 		auto &results = det->run(img);
 		for (const auto &r : results) {
-			if (r.score > g_burst[i].score) {
-				g_burst[i].score = r.score;
+			if (r.score > f.score) {
+				f.score = r.score;
 			}
 		}
+		const uint32_t inf_ms = millis() - t_inf;
 		heap_caps_free(img.data);
 
-		if (g_burst[i].score >= DETECT_SCORE_THRESHOLD) {
-			g_burst[i].hit = true;
+		if (f.score >= DETECT_SCORE_THRESHOLD) {
+			f.hit = true;
 			hits++;
-			if (hits == 1 && on_first_hit) {
+			if (hits + *errors == 1 && on_first_hit) {
 				// This burst is going out. Start the radio now so the
 				// handshake runs against the remaining frames' inference
 				// rather than after it.
 				on_first_hit();
 			}
 		}
-		log_i("frame %d: best score %.2f%s", i, g_burst[i].score,
-		      g_burst[i].hit ? " HIT" : "");
+		log_i("frame %d: %ux%u decode %lu ms, inference %lu ms, best score "
+		      "%.2f%s", i, img.width, img.height, (unsigned long)dec_ms,
+		      (unsigned long)inf_ms, f.score, f.hit ? " HIT" : "");
 	}
 
 	delete det;
-	log_i("%s detection over %d frames: %d hits in %lu ms",
-	      DETECT_MODEL_NAME, g_burst_n, hits, (unsigned long)(millis() - t0));
+	log_i("%s detection over %d frames: %d hits, %d errors in %lu ms",
+	      DETECT_MODEL_NAME, g_burst_n, hits, *errors,
+	      (unsigned long)(millis() - t0));
 	return hits;
 }
 
@@ -542,9 +643,10 @@ static int detect_over_buffer(void (*on_first_hit)())
 // Nothing ever hits here, so on_first_hit is never called and this build never
 // raises the radio for a burst — which is what keeps the sleep-current
 // measurement that step 5 is after comparable to the real firmware's.
-static int detect_over_buffer(void (*on_first_hit)())
+static int detect_over_buffer(void (*on_first_hit)(), int *errors)
 {
 	(void)on_first_hit;
+	*errors = 0;
 	log_w("detection disabled at compile time; discarding %d buffered frames",
 	      g_burst_n);
 	return 0;
@@ -574,14 +676,16 @@ int32_t battery_mv()
 // never reaches into this file's state directly (deploy_mode.h).
 void deploy_fill_status(deploy_status_t *out)
 {
-	out->triggers_total          = rtc_triggers_total;
-	out->triggers_since_report   = rtc_triggers_since_report;
-	out->suppressed_total        = rtc_suppressed_total;
-	out->suppressed_since_report = rtc_suppressed_since_report;
-	out->last_report_s           = rtc_last_report_s;
-	out->have_ap_cache           = rtc_have_ap;
-	out->using_dhcp              = rtc_use_dhcp;
-	out->ap_channel              = rtc_channel;
+	out->triggers_total             = rtc_triggers_total;
+	out->triggers_since_report      = rtc_triggers_since_report;
+	out->suppressed_total           = rtc_suppressed_total;
+	out->suppressed_since_report    = rtc_suppressed_since_report;
+	out->detect_errors_total        = rtc_detect_errors_total;
+	out->detect_errors_since_report = rtc_detect_errors_since_report;
+	out->last_report_s              = rtc_last_report_s;
+	out->have_ap_cache              = rtc_have_ap;
+	out->using_dhcp                 = rtc_use_dhcp;
+	out->ap_channel                 = rtc_channel;
 	memcpy(out->ap_bssid, rtc_bssid, sizeof(out->ap_bssid));
 }
 
@@ -920,6 +1024,10 @@ static String telemetry_text(const char *reason, float score, int idx, int total
 	c += rtc_suppressed_total;
 	c += " (+";
 	c += rtc_suppressed_since_report;
+	c += ")\ndetect errors ";
+	c += rtc_detect_errors_total;
+	c += " (+";
+	c += rtc_detect_errors_since_report;
 	c += ")\nbattery ";
 
 	const int32_t mv = battery_mv();
@@ -951,9 +1059,11 @@ static String telemetry_text(const char *reason, float score, int idx, int total
 // ---------------------------------------------------------------------------
 static bool send_frames(const char *reason, bool only_hits)
 {
+	// With only_hits, frames detection could not judge go out too (fail
+	// open, detect_over_buffer()).
 	int total = 0;
 	for (int i = 0; i < g_burst_n; i++) {
-		if (!only_hits || g_burst[i].hit) {
+		if (!only_hits || g_burst[i].hit || g_burst[i].err) {
 			total++;
 		}
 	}
@@ -977,11 +1087,12 @@ static bool send_frames(const char *reason, bool only_hits)
 
 	int sent = 0, idx = 0;
 	for (int i = 0; i < g_burst_n; i++) {
-		if (only_hits && !g_burst[i].hit) {
+		if (only_hits && !g_burst[i].hit && !g_burst[i].err) {
 			continue;
 		}
 		const int n = ++idx;
-		const String cap = telemetry_text(reason, g_burst[i].score, n - 1, total);
+		const String cap = telemetry_text(g_burst[i].err ? "detect_error_unjudged" : reason,
+		                                  g_burst[i].score, n - 1, total);
 		if (telegram_send_photo(g_burst[i].data, g_burst[i].len, cap)) {
 			sent++;
 		} else {
@@ -993,9 +1104,10 @@ static bool send_frames(const char *reason, bool only_hits)
 	if (sent > 0) {
 		// Counters are cumulative "since last report" (9.3) — clear them only
 		// once a report has actually landed somewhere.
-		rtc_triggers_since_report   = 0;
-		rtc_suppressed_since_report = 0;
-		rtc_last_report_s           = now_s();
+		rtc_triggers_since_report      = 0;
+		rtc_suppressed_since_report    = 0;
+		rtc_detect_errors_since_report = 0;
+		rtc_last_report_s              = now_s();
 	}
 	log_i("sent %d/%d frames", sent, total);
 	return sent == total;
@@ -1045,9 +1157,10 @@ static void maybe_send_telemetry_only()
 	}
 
 	if (telegram_send_message(telemetry_text("telemetry", 0.0f, 0, 0))) {
-		rtc_triggers_since_report   = 0;
-		rtc_suppressed_since_report = 0;
-		rtc_last_report_s           = now_s();
+		rtc_triggers_since_report      = 0;
+		rtc_suppressed_since_report    = 0;
+		rtc_detect_errors_since_report = 0;
+		rtc_last_report_s              = now_s();
 	}
 	wifi_down();
 }
@@ -1484,23 +1597,26 @@ void setup()
 	// that is the one case where the transmission is certain regardless of
 	// what the detector finds. Otherwise the radio waits for the first hit —
 	// see detect_over_buffer().
+	int errors = 0;
 #if WIFI_EARLY_START
 	if (telemetry_due()) {
 		wifi_begin_async();
 	}
 	const int buffered = g_burst_n;
-	const int hits = detect_over_buffer(wifi_begin_async);
+	const int hits = detect_over_buffer(wifi_begin_async, &errors);
 #else
 	const int buffered = g_burst_n;
-	const int hits = detect_over_buffer(nullptr);
+	const int hits = detect_over_buffer(nullptr, &errors);
 #endif
 
-	if (hits > 0) {
-		// Counted first: send_frames() builds the captions from these and
-		// then clears the since-report ones, so counting afterwards would
-		// report this burst's suppressions with the next report instead.
-		rtc_suppressed_since_report += (buffered - hits);
-		rtc_suppressed_total        += (buffered - hits);
+	// Counted first: send_frames() builds the captions from these and then
+	// clears the since-report ones, so counting afterwards would report this
+	// burst's suppressions with the next report instead.
+	rtc_detect_errors_since_report += errors;
+	rtc_detect_errors_total        += errors;
+	if (hits + errors > 0) {
+		rtc_suppressed_since_report += (buffered - hits - errors);
+		rtc_suppressed_total        += (buffered - hits - errors);
 		send_frames("burst_detected", /*only_hits=*/true);
 	} else {
 		rtc_suppressed_since_report += buffered;

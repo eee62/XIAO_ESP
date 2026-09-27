@@ -163,6 +163,15 @@
 #define DETECT_SCORE_THRESHOLD 0.50f
 #endif
 
+// Detection decodes each JPEG at the smallest power-of-two reduction (1/1,
+// 1/2, 1/4 or 1/8, the decoder's limit) that brings its width to this or less.
+// The model's preprocessor resizes whatever it is given to its own input size,
+// so a bigger decode buys nothing but time and PSRAM, and a full-size decode
+// stops fitting at all at high resolution: 2592 x 1944 RGB888 is 15 MB, more
+// than all 8 MB of PSRAM. 800 decodes SVGA at full size and QSXGA at 1/4
+// (640 x 480, 0.9 MB).
+#define DETECT_DECODE_MAX_W    800
+
 // ---------------------------------------------------------------------------
 // WiFi — PROJECT_BRIEF.md 9.4: static IP and a cached BSSID/channel, so the
 // common wake skips both the scan and the DHCP exchange.

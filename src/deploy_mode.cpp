@@ -249,6 +249,8 @@ static String status_json()
 	j += ",\"trig_since\":";    j += s.triggers_since_report;
 	j += ",\"supp_total\":";    j += s.suppressed_total;
 	j += ",\"supp_since\":";    j += s.suppressed_since_report;
+	j += ",\"derr_total\":";    j += s.detect_errors_total;
+	j += ",\"derr_since\":";    j += s.detect_errors_since_report;
 	j += ",\"last_report\":";   j += s.last_report_s;
 	j += ",\"ap_cache\":";      j += s.have_ap_cache ? "true" : "false";
 	j += ",\"net_mode\":\"";     j += s.using_dhcp ? "dhcp" : "static";
@@ -412,6 +414,7 @@ function render(d){
   row('Last frame',d.frames?kb(d.frame_len)+' · '+d.frames+' served':'—');
   row('Triggers',d.trig_total+' total · '+d.trig_since+' unreported');
   row('Suppressed',d.supp_total+' total · '+d.supp_since+' unreported');
+  row('Detect errors',d.derr_total+' total · '+d.derr_since+' unreported');
   row('Last report',d.last_report?dur(d.uptime-d.last_report)+' ago':'never');
   row('Burst rule',d.burst_n+' in '+d.burst_w+'s, settle '+d.burst_settle+'s');
   row('Detection',d.model+(d.model=='disabled'?'':' @ '+d.thr));
