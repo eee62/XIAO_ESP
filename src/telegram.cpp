@@ -2,15 +2,14 @@
 
 #include <Arduino.h>
 #include <WiFiClientSecure.h>
-#include <esp_heap_caps.h>
 
 #include "config.h"
 #include "telegram.h"
 
 // TLS records are 16 kB at most and mbedtls copies through its own buffer, so
-// feeding it the whole 120 kB body in one write() buys nothing and makes a
-// stall harder to attribute. This is also the granularity at which a dropped
-// link is noticed.
+// feeding it a whole payload in one write() buys nothing and makes a stall
+// harder to attribute. This is also the granularity at which a dropped link
+// is noticed and the overall cap is checked.
 #define TG_WRITE_CHUNK 4096
 
 // Enough of the API's JSON error to be actionable in a serial log
@@ -32,14 +31,36 @@ bool telegram_configured()
 // ---------------------------------------------------------------------------
 // One request, start to finish.
 //
-// `body` is sent verbatim with the given Content-Type. Returns true on 2xx.
+// The body goes out as a list of segments written back to back, so a
+// multipart upload streams its head, the payload straight from where it
+// already sits in PSRAM, and its tail, without assembling a copy. Content-
+// Length is their sum, known before the first byte. Returns true on 2xx.
+//
+// Two limits, neither of which scales badly with size (config.h):
+//   - a stall: TELEGRAM_STALL_MS without write progress. ssl_client.cpp does
+//     the watching: connect() stores its timeout as the socket timeout, and
+//     send_ssl_data() fails a write that makes no progress for that long;
+//   - a cap on the whole upload and reply, TELEGRAM_POST_BASE_S plus
+//     Content-Length / TELEGRAM_MIN_BPS, counted from the TLS session being
+//     up. The connect has its own bounds: DNS, the TCP connect (also
+//     TELEGRAM_STALL_MS) and TELEGRAM_HANDSHAKE_S.
 // ---------------------------------------------------------------------------
+struct tg_seg_t {
+	const uint8_t *data;
+	size_t         len;
+};
+
 static bool tg_post(const char *method, const char *content_type,
-                    const uint8_t *body, size_t body_len)
+                    const tg_seg_t *segs, int nsegs)
 {
 	if (!telegram_configured()) {
 		log_e("telegram: no token/chat_id compiled in (see include/secrets.h)");
 		return false;
+	}
+
+	size_t body_len = 0;
+	for (int i = 0; i < nsegs; i++) {
+		body_len += segs[i].len;
 	}
 
 	WiFiClientSecure client;
@@ -51,14 +72,19 @@ static bool tg_post(const char *method, const char *content_type,
 #endif
 	client.setHandshakeTimeout(TELEGRAM_HANDSHAKE_S);
 
-	const uint32_t t0 = millis();
-	if (!client.connect(TELEGRAM_HOST, TELEGRAM_PORT, TELEGRAM_TIMEOUT_MS)) {
+	const uint32_t t_connect = millis();
+	if (!client.connect(TELEGRAM_HOST, TELEGRAM_PORT, TELEGRAM_STALL_MS)) {
 		// Covers DNS failure too, which on a static-IP node (9.4) usually
 		// means NET_DNS is pointing at something that is not a resolver.
 		log_w("telegram: connect to %s:%d failed", TELEGRAM_HOST, TELEGRAM_PORT);
 		return false;
 	}
-	log_i("telegram: TLS up in %lu ms", (unsigned long)(millis() - t0));
+	const uint32_t t0 = millis();
+	const uint32_t cap_ms = (uint32_t)TELEGRAM_POST_BASE_S * 1000u +
+	                        (uint32_t)((uint64_t)body_len * 1000u / TELEGRAM_MIN_BPS);
+	log_i("telegram: TLS up in %lu ms; %u bytes, allowed %lu s",
+	      (unsigned long)(t0 - t_connect), (unsigned)body_len,
+	      (unsigned long)(cap_ms / 1000));
 
 	String req;
 	req.reserve(256 + sizeof(TELEGRAM_TOKEN));
@@ -85,27 +111,38 @@ static bool tg_post(const char *method, const char *content_type,
 		return false;
 	}
 
-	size_t off = 0;
-	while (off < body_len) {
-		const size_t want = (body_len - off < TG_WRITE_CHUNK)
-		                        ? (body_len - off) : (size_t)TG_WRITE_CHUNK;
-		const int wrote = client.write(body + off, want);
-		if (wrote <= 0) {
-			log_w("telegram: body write stalled at %u/%u",
-			      (unsigned)off, (unsigned)body_len);
-			client.stop();
-			return false;
-		}
-		off += (size_t)wrote;
+	size_t sent = 0;
+	for (int i = 0; i < nsegs; i++) {
+		size_t off = 0;
+		while (off < segs[i].len) {
+			const size_t left = segs[i].len - off;
+			const size_t want = left < TG_WRITE_CHUNK ? left : (size_t)TG_WRITE_CHUNK;
+			const int wrote = client.write(segs[i].data + off, want);
+			if (wrote <= 0) {
+				// No progress for TELEGRAM_STALL_MS, or the link dropped.
+				log_w("telegram: body write stalled at %u/%u",
+				      (unsigned)sent, (unsigned)body_len);
+				client.stop();
+				return false;
+			}
+			off  += (size_t)wrote;
+			sent += (size_t)wrote;
 
-		if (millis() - t0 > TELEGRAM_TIMEOUT_MS) {
-			log_w("telegram: upload timed out at %u/%u",
-			      (unsigned)off, (unsigned)body_len);
-			client.stop();
-			return false;
+			if (millis() - t0 > cap_ms) {
+				log_w("telegram: upload over its %lu s cap at %u/%u",
+				      (unsigned long)(cap_ms / 1000), (unsigned)sent,
+				      (unsigned)body_len);
+				client.stop();
+				return false;
+			}
 		}
 	}
+	const uint32_t up_ms = millis() - t0;
 
+	// Status line. Telegram has the whole body by now bar what is still in
+	// the TCP send buffer, so the reply gets one stall's grace from the last
+	// write, inside the same overall cap.
+	const uint32_t t_sent = millis();
 	// Status line.
 	while (!client.available()) {
 		if (!client.connected()) {
@@ -113,8 +150,9 @@ static bool tg_post(const char *method, const char *content_type,
 			client.stop();
 			return false;
 		}
-		if (millis() - t0 > TELEGRAM_TIMEOUT_MS) {
-			log_w("telegram: no reply within %d ms", TELEGRAM_TIMEOUT_MS);
+		if (millis() - t_sent > TELEGRAM_STALL_MS || millis() - t0 > cap_ms) {
+			log_w("telegram: no reply %lu ms after the upload",
+			      (unsigned long)(millis() - t_sent));
 			client.stop();
 			return false;
 		}
@@ -169,8 +207,12 @@ static bool tg_post(const char *method, const char *content_type,
 		reply[got] = '\0';
 		log_e("telegram: %s -> HTTP %d %s", method, code, reply);
 	} else {
-		log_i("telegram: %s ok (%u bytes, %lu ms)", method,
-		      (unsigned)body_len, (unsigned long)(millis() - t0));
+		// Upload rate is the number to watch on a weak link: it is what
+		// TELEGRAM_MIN_BPS has to stay under.
+		log_i("telegram: %s ok (%u bytes, upload %lu ms, %lu B/s, total %lu ms)",
+		      method, (unsigned)body_len, (unsigned long)up_ms,
+		      (unsigned long)(up_ms ? (uint64_t)body_len * 1000u / up_ms : 0),
+		      (unsigned long)(millis() - t_connect));
 	}
 
 	client.stop();
@@ -178,7 +220,10 @@ static bool tg_post(const char *method, const char *content_type,
 }
 
 // ---------------------------------------------------------------------------
-// multipart/form-data body, assembled in PSRAM.
+// multipart/form-data. Only the small parts are assembled; the payload is
+// written from where it already sits. 9.6 has the whole body assembled in
+// PSRAM; its point, keeping a frame off the stack, still holds, and streaming
+// saves the second PSRAM copy of every payload.
 // ---------------------------------------------------------------------------
 static void append_field(String &s, const char *name, const char *value)
 {
@@ -190,10 +235,11 @@ static void append_field(String &s, const char *name, const char *value)
 	s += "\r\n";
 }
 
-bool telegram_send_photo(const uint8_t *jpeg, size_t len,
-                         const String &caption)
+bool telegram_send_file(const char *method, const char *field,
+                        const char *filename, const char *content_type,
+                        const uint8_t *data, size_t len, const String &caption)
 {
-	if (!jpeg || len == 0) {
+	if (!data || len == 0) {
 		return false;
 	}
 
@@ -202,38 +248,43 @@ bool telegram_send_photo(const uint8_t *jpeg, size_t len,
 	append_field(head, "chat_id", TELEGRAM_CHAT_ID);
 	if (caption.length()) {
 		// Bot API caps captions at 1024 characters and rejects the whole
-		// request over that — never worth losing the photo for.
+		// request over that — never worth losing the upload for.
 		const String cap = caption.length() > 1000 ? caption.substring(0, 1000)
 		                                           : caption;
 		append_field(head, "caption", cap.c_str());
 	}
 	head += "--" TELEGRAM_BOUNDARY "\r\n";
-	head += "Content-Disposition: form-data; name=\"photo\"; "
-	        "filename=\"capture.jpg\"\r\n";
-	head += "Content-Type: image/jpeg\r\n\r\n";
+	head += "Content-Disposition: form-data; name=\"";
+	head += field;
+	head += "\"; filename=\"";
+	head += filename;
+	head += "\"\r\nContent-Type: ";
+	head += content_type;
+	head += "\r\n\r\n";
 
 	static const char TAIL[] = "\r\n--" TELEGRAM_BOUNDARY "--\r\n";
-	const size_t tail_len = sizeof(TAIL) - 1;
-	const size_t total    = head.length() + len + tail_len;
+	const tg_seg_t segs[] = {
+		{(const uint8_t *)head.c_str(), head.length()},
+		{data, len},
+		{(const uint8_t *)TAIL, sizeof(TAIL) - 1},
+	};
+	return tg_post(method, "multipart/form-data; boundary=" TELEGRAM_BOUNDARY,
+	               segs, 3);
+}
 
-	// PSRAM, explicitly (9.6). The frame is already there; this is the second
-	// copy of it and the largest single allocation in the send path.
-	uint8_t *body = (uint8_t *)heap_caps_malloc(total, MALLOC_CAP_SPIRAM);
-	if (!body) {
-		log_e("telegram: no PSRAM for a %u byte multipart body",
-		      (unsigned)total);
-		return false;
-	}
-
-	memcpy(body, head.c_str(), head.length());
-	memcpy(body + head.length(), jpeg, len);
-	memcpy(body + head.length() + len, TAIL, tail_len);
-
-	const bool ok = tg_post("sendPhoto",
-	                        "multipart/form-data; boundary=" TELEGRAM_BOUNDARY,
-	                        body, total);
-	heap_caps_free(body);
-	return ok;
+bool telegram_send_photo(const uint8_t *jpeg, size_t len, const String &caption)
+{
+#if TELEGRAM_STILL_AS_DOCUMENT
+	// The original bytes. sendPhoto has Telegram recompress the image on its
+	// side, which throws away exactly the detail the still settings are for.
+	// A departure from 9.6, which names sendPhoto; set
+	// TELEGRAM_STILL_AS_DOCUMENT to 0 for the brief's behaviour.
+	return telegram_send_file("sendDocument", "document", "capture.jpg",
+	                          "image/jpeg", jpeg, len, caption);
+#else
+	return telegram_send_file("sendPhoto", "photo", "capture.jpg",
+	                          "image/jpeg", jpeg, len, caption);
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -252,7 +303,7 @@ bool telegram_send_message(const String &text)
 	append_field(body, "text", msg.c_str());
 	body += "--" TELEGRAM_BOUNDARY "--\r\n";
 
+	const tg_seg_t seg = {(const uint8_t *)body.c_str(), body.length()};
 	return tg_post("sendMessage",
-	               "multipart/form-data; boundary=" TELEGRAM_BOUNDARY,
-	               (const uint8_t *)body.c_str(), body.length());
+	               "multipart/form-data; boundary=" TELEGRAM_BOUNDARY, &seg, 1);
 }

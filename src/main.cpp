@@ -1098,7 +1098,8 @@ static String telemetry_text(const char *reason, float score, int idx, int total
 }
 
 // ---------------------------------------------------------------------------
-// Sending (9.6) — Telegram sendPhoto, straight from PSRAM.
+// Sending (9.6) — Telegram sendDocument (or sendPhoto, config.h), streamed
+// straight from PSRAM.
 //
 // There is no retry store. A frame that cannot be delivered on this wake is
 // dropped, and the only trace of it is the trigger counters, which is exactly
@@ -1448,15 +1449,43 @@ static void wake_deadline_expired(void *)
 // config.h works WAKE_DEADLINE_S out by hand. PIR_IDLE_MAX_S lives in this
 // file, so this is where the sum can be checked. Seconds throughout; config.h
 // derives each term.
+//
+// Pixels in a frame size, from esp32-camera's resolution table (sensor.c),
+// which is not constexpr. Only the sizes this firmware might be set to; any
+// other gives 0 and fails the build below, so the table gets extended rather
+// than the check skipped.
+static constexpr uint32_t framesize_pixels(framesize_t f)
+{
+	return f == FRAMESIZE_VGA   ?  640u *  480u :
+	       f == FRAMESIZE_SVGA  ?  800u *  600u :
+	       f == FRAMESIZE_XGA   ? 1024u *  768u :
+	       f == FRAMESIZE_HD    ? 1280u *  720u :
+	       f == FRAMESIZE_SXGA  ? 1280u * 1024u :
+	       f == FRAMESIZE_UXGA  ? 1600u * 1200u :
+	       f == FRAMESIZE_FHD   ? 1920u * 1080u :
+	       f == FRAMESIZE_QXGA  ? 2048u * 1536u :
+	       f == FRAMESIZE_QSXGA ? 2560u * 1920u :
+	       f == FRAMESIZE_5MP   ? 2592u * 1944u : 0u;
+}
+static_assert(framesize_pixels(CAM_FRAMESIZE) != 0,
+              "add CAM_FRAMESIZE to framesize_pixels()");
+
 #define DNS_LOOKUP_MAX_S  (7 * CONFIG_LWIP_DNS_MAX_SERVERS)
-#define TG_CONNECT_MAX_S  (DNS_LOOKUP_MAX_S + TELEGRAM_TIMEOUT_MS / 1000 + \
+#define TG_CONNECT_MAX_S  (DNS_LOOKUP_MAX_S + TELEGRAM_STALL_MS / 1000 + \
                            TELEGRAM_HANDSHAKE_S)
-#define TG_STALL_MAX_S    (2 * TELEGRAM_TIMEOUT_MS / 1000)
-#define TG_POST_MAX_S     (TG_CONNECT_MAX_S > TG_STALL_MAX_S ? TG_CONNECT_MAX_S : \
-                                                               TG_STALL_MAX_S)
+// Multipart head (chat_id, a caption cut to 1000 bytes, the file part's
+// headers) and tail, rounded up.
+#define TG_MULTIPART_MAX  1536
+// One tg_post() of `bytes`, the rate term rounded up.
+#define TG_POST_MAX_S(bytes) (TG_CONNECT_MAX_S + TELEGRAM_POST_BASE_S +          \
+                              ((bytes) + TELEGRAM_MIN_BPS - 1) / TELEGRAM_MIN_BPS + \
+                              TELEGRAM_STALL_MS / 1000)
+// The driver's JPEG buffer (cam_hal.c, FRAME_SIZE_AUTO) bounds a still.
+#define STILL_MAX_BYTES   (framesize_pixels(CAM_FRAMESIZE) / 5 + TG_MULTIPART_MAX)
 static_assert(WAKE_DEADLINE_S > BURST_MAX_DURATION + BURST_SETTLE + 2 * PIR_IDLE_MAX_S +
                                 (WIFI_CONNECT_TIMEOUT_MS + WIFI_DHCP_TIMEOUT_MS) / 1000 +
-                                2 * DNS_LOOKUP_MAX_S + BURST_MAX_FRAMES * TG_POST_MAX_S,
+                                2 * DNS_LOOKUP_MAX_S +
+                                BURST_MAX_FRAMES * TG_POST_MAX_S(STILL_MAX_BYTES),
               "WAKE_DEADLINE_S no longer covers the longest normal wake (config.h)");
 
 // Never stopped: every path after setup() arms it ends in deep sleep, which

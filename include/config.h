@@ -293,11 +293,33 @@
 #define TELEGRAM_CAPTION_PREFIX   ""
 #endif
 
-// Covers DNS + TCP + TLS handshake + upload. Deliberately far longer than the
-// 4 s the old LAN POST allowed: a cold TLS handshake on an ESP32-S3 is 1-3 s by
-// itself, and the camera is already unpowered by this point (9.1 step 5), so
-// waiting here costs radio time rather than the expensive kind.
-#define TELEGRAM_TIMEOUT_MS       15000
+// Stills go out with sendDocument: the original JPEG, byte for byte, as a
+// capture.jpg file. sendPhoto (0) has Telegram recompress the image to its
+// own photo size and quality, which undoes the still settings above.
+#define TELEGRAM_STILL_AS_DOCUMENT 1
+
+// Upload limits. There are two, because no single fixed timeout suits both a
+// 100 kB SVGA still and a multi-megabyte one on a weak link. The old
+// TELEGRAM_TIMEOUT_MS ran from before the connect, so connect plus the whole
+// upload had to fit in 15 s.
+//
+// TELEGRAM_STALL_MS is how long the link may make no progress. ssl_client.cpp
+// takes connect()'s timeout as its socket timeout and uses it for the TCP
+// connect and for every write, which fails after that long without a byte
+// accepted; tg_post() also gives the reply that long after the last write.
+//
+// TELEGRAM_POST_BASE_S + bytes / TELEGRAM_MIN_BPS caps one upload and its
+// reply, counted from the TLS session being up. TELEGRAM_MIN_BPS is the
+// slowest link still worth the battery: at 16 kB/s a 1 MB still is allowed
+// 30 + 64 s. A link that slow costs radio-on time at ~250 mA (7), about
+// 7 mAh for that still, so the floor is an energy decision as much as a
+// patience one. The camera is off throughout (9.1 step 5).
+//
+// A cold TLS handshake on an ESP32-S3 is 1-3 s by itself; TELEGRAM_HANDSHAKE_S
+// bounds it.
+#define TELEGRAM_STALL_MS         15000
+#define TELEGRAM_POST_BASE_S      30
+#define TELEGRAM_MIN_BPS          16000
 #define TELEGRAM_HANDSHAKE_S      10
 
 // Chain validation off by default. See 9.6 for the reasoning: a node that may
@@ -306,9 +328,9 @@
 // and supply TELEGRAM_ROOT_CA if the threat model justifies it.
 #define TELEGRAM_INSECURE_TLS     1
 
-// Fixed boundary. Safe because the body is assembled here and a JPEG cannot
-// contain this byte sequence at a position that would matter -- the length is
-// declared up front via Content-Length, so no scanning for it takes place.
+// Fixed boundary. Safe because the length is declared up front via
+// Content-Length, so a JPEG that happens to contain this byte sequence is
+// never scanned for it.
 #define TELEGRAM_BOUNDARY  "----wildlifenode6f2a91c4b7"
 
 // ---------------------------------------------------------------------------
@@ -383,34 +405,32 @@
 //   +  12 s  WIFI_CONNECT_TIMEOUT_MS + WIFI_DHCP_TIMEOUT_MS
 //   +  42 s  2 x DNS lookup       wifi_reachable() on the static address,
 //                                 then on the DHCP lease
-//   + 368 s  BURST_MAX_FRAMES x 46 s, one tg_post() per frame
-//   = 1112 s
+//   + 784 s  BURST_MAX_FRAMES x 98 s, one tg_post() per frame
+//   = 1528 s
 //
 // A DNS lookup ends only when lwIP gives up: four tries per configured
 // server, 1, 1, 2 and 3 s apart, for up to CONFIG_LWIP_DNS_MAX_SERVERS (3)
 // servers, so 21 s. NetworkManager::hostByName() adds no timeout of its own.
 //
-// TELEGRAM_TIMEOUT_MS does not cap a tg_post(). telegram.cpp checks it only
-// after each body write, and ssl_client.cpp reuses it as the TCP connect
-// timeout and as how long one write may go without progress. A frame takes
-// the longer of two paths:
-//   - A slow connect, 46 s: connect() resolves TELEGRAM_HOST again (21 s; a
-//     cache hit only while the record's TTL lasts), then the TCP connect
-//     (15 s) and TELEGRAM_HANDSHAKE_S (10 s), and the first check fails. No
-//     write stall adds to this. The request head and the first
-//     TG_WRITE_CHUNK, ~4.4 kB between them, fit the empty 5744-byte TCP send
-//     buffer, so both writes return at once. That stops holding if
-//     TG_WRITE_CHUNK grows past the buffer.
-//   - A quick connect, 30 s: a check that passes at 15 s, then one write
-//     that stalls for the full 15 s.
+// One tg_post() of B bytes takes at most:
+//      46 s  the connect: TELEGRAM_HOST resolved again (21 s; a cache hit
+//            only while the record's TTL lasts), the TCP connect
+//            (TELEGRAM_STALL_MS) and TELEGRAM_HANDSHAKE_S
+//   +  TELEGRAM_POST_BASE_S + B / TELEGRAM_MIN_BPS, the upload cap
+//   +  15 s  one TELEGRAM_STALL_MS past the cap: the cap is checked between
+//            writes, and a write returns only on progress or a full stall
+// For a still, B is the driver's frame buffer at CAM_FRAMESIZE (w x h / 5; a
+// bigger frame never reaches PSRAM) plus 1.5 kB of multipart head and tail.
+// At SVGA that is 97.5 kB, 7 s at the floor rate: 46 + 30 + 7 + 15 = 98 s.
 //
-// 20 minutes leaves 88 s for what the code does not bound: two camera
-// bring-ups and detection over BURST_MAX_FRAMES frames, seconds rather than
-// minutes. main.cpp checks the sum at compile time, so retuning a term past
-// this fails the build instead of cutting long bursts short. A hang that runs
-// the full 20 minutes with the radio up costs something like 30 mAh, a few
-// days of the 7 budget, rather than the cell.
-#define WAKE_DEADLINE_S          (20 * 60)
+// 27 minutes leaves 92 s for what no single timeout bounds: the camera
+// bring-ups outside the burst cap, ~10 s each at worst (init, CAM_WARMUP_MS,
+// and two 4 s fb_get() timeouts when a frame overflows its buffer), and
+// detection over BURST_MAX_FRAMES frames. main.cpp checks the sum at compile
+// time, so retuning a term past this fails the build instead of cutting long
+// bursts short. A hang that runs the full 27 minutes with the radio up costs
+// something like 40 mAh, several days of the 7 budget, rather than the cell.
+#define WAKE_DEADLINE_S          (27 * 60)
 
 // ---------------------------------------------------------------------------
 // Deployment mode — held-BOOT-button setup/aiming interface.
