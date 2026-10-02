@@ -182,6 +182,15 @@ RTC_DATA_ATTR static uint8_t  rtc_channel = 0;
 // again on any association failure — see wifi_wait_connected().
 RTC_DATA_ATTR static bool     rtc_use_dhcp = false;
 
+// now_s() when a DHCP lease was last obtained, so WIFI_HOSTNAME last reached
+// the router (config.h, HOSTNAME_REFRESH_INTERVAL_S); DHCP_REFRESH_NEVER
+// since power-on.
+#define DHCP_REFRESH_NEVER 0xFFFFFFFFu
+RTC_DATA_ATTR static uint32_t rtc_last_dhcp_refresh_s = DHCP_REFRESH_NEVER;
+// now_s() of the last refresh that got no lease, for HOSTNAME_REFRESH_RETRY_S;
+// DHCP_REFRESH_NEVER when the last one did, or none has failed.
+RTC_DATA_ATTR static uint32_t rtc_last_refresh_fail_s = DHCP_REFRESH_NEVER;
+
 // Abnormal resets since power-on (see reset_was_abnormal()), for the report
 // (9.3). This is the only way to find out whether the brownouts in 10 happen
 // in the field. Not RTC_DATA_ATTR: that is reloaded by exactly the resets
@@ -813,6 +822,8 @@ static bool     s_wifi_pending   = false;  // begin() issued, outcome unknown
 static bool     s_wifi_connected = false;
 static bool     s_wifi_dhcp      = false;  // which phase is currently in flight
 static uint32_t s_wifi_t0        = 0;
+static bool     s_wifi_refresh   = false;  // the attempt in flight is a hostname refresh
+static bool     s_refresh_tried  = false;  // at most one refresh attempt per wake
 
 static void wifi_down()
 {
@@ -855,6 +866,33 @@ static void wifi_set_hostname()
 	}
 }
 
+#define DHCP_REFRESH_ENABLED (HOSTNAME_REFRESH_INTERVAL_S > 0 && WIFI_DHCP_TIMEOUT_MS > 0)
+
+// A DHCP lease was just obtained: WIFI_HOSTNAME has reached the router.
+static void dhcp_lease_noted()
+{
+	rtc_last_dhcp_refresh_s = now_s();
+	rtc_last_refresh_fail_s = DHCP_REFRESH_NEVER;
+}
+
+// Is this wake's first association due to be a hostname refresh (config.h,
+// HOSTNAME_REFRESH_INTERVAL_S)? Only when the normal path would be static: a
+// node on rtc_use_dhcp sends the name on every association anyway. Not within
+// HOSTNAME_REFRESH_RETRY_S of a refresh that got no lease.
+static bool dhcp_refresh_due()
+{
+#if DHCP_REFRESH_ENABLED
+	const uint32_t t = now_s();
+	return !s_wifi_dhcp && !s_refresh_tried &&
+	       (rtc_last_dhcp_refresh_s == DHCP_REFRESH_NEVER ||
+	        t - rtc_last_dhcp_refresh_s >= (uint32_t)HOSTNAME_REFRESH_INTERVAL_S) &&
+	       (rtc_last_refresh_fail_s == DHCP_REFRESH_NEVER ||
+	        t - rtc_last_refresh_fail_s >= (uint32_t)HOSTNAME_REFRESH_RETRY_S);
+#else
+	return false;
+#endif
+}
+
 // Kick off association and return without waiting. Idempotent, so the callers
 // that start the radio early and the send path that needs it can both call it.
 static void wifi_begin_async()
@@ -873,6 +911,13 @@ static void wifi_begin_async()
 #else
 	s_wifi_dhcp = false;
 #endif
+	// A hostname refresh replaces the static fast path for this one attempt;
+	// wifi_wait_connected() falls back to that path if it fails.
+	s_wifi_refresh = dhcp_refresh_due();
+	if (s_wifi_refresh) {
+		s_refresh_tried = true;
+		s_wifi_dhcp     = true;
+	}
 
 	WiFi.persistent(false);
 	wifi_set_hostname();
@@ -888,7 +933,8 @@ static void wifi_begin_async()
 
 	s_wifi_t0      = millis();
 	s_wifi_pending = true;
-	log_i("wifi: associating (%s, %s)", s_wifi_dhcp ? "dhcp" : "static",
+	log_i("wifi: associating (%s, %s)",
+	      s_wifi_refresh ? "dhcp, hostname refresh" : s_wifi_dhcp ? "dhcp" : "static",
 	      rtc_have_ap ? "cached ap" : "scan");
 }
 
@@ -955,6 +1001,47 @@ static bool wifi_wait_connected()
 		}
 	}
 
+#if DHCP_REFRESH_ENABLED
+	// ---- Hostname refresh (config.h, HOSTNAME_REFRESH_INTERVAL_S) --------
+	// A DHCP attempt in place of the static fast path, once a refresh is due.
+	// The lease alone counts as success: its DISCOVER and REQUEST carried
+	// WIFI_HOSTNAME. If it also resolves TELEGRAM_HOST this wake sends over
+	// it; if not, the normal path below runs as on any other wake. With no
+	// lease at all the refresh is still owed, and the first wake that
+	// associates HOSTNAME_REFRESH_RETRY_S or more later tries it again. It
+	// touches neither rtc_use_dhcp nor the AP
+	// cache, except to refresh the cache on success as every successful
+	// phase below does.
+	if (s_wifi_refresh) {
+		s_wifi_refresh = false;
+		if (wifi_await(WIFI_DHCP_TIMEOUT_MS)) {
+			dhcp_lease_noted();
+			log_i("wifi: hostname refresh: lease %s as \"%s\" in %lu ms",
+			      WiFi.localIP().toString().c_str(), WIFI_HOSTNAME,
+			      (unsigned long)(millis() - s_wifi_t0));
+			if (wifi_reachable()) {
+				wifi_cache_ap();
+				s_wifi_connected = true;
+				return true;
+			}
+			log_w("wifi: refresh lease cannot resolve %s; normal path",
+			      TELEGRAM_HOST);
+		} else {
+			rtc_last_refresh_fail_s = now_s();
+			log_w("wifi: hostname refresh got no lease in %lu ms; normal path, "
+			      "next refresh in %d s at the earliest",
+			      (unsigned long)(millis() - s_wifi_t0), HOSTNAME_REFRESH_RETRY_S);
+		}
+		WiFi.disconnect(true, false);
+		delay(10);
+		s_wifi_pending = false;
+		wifi_begin_async();   // s_refresh_tried is set: the normal path
+		if (!s_wifi_pending) {
+			return false;
+		}
+	}
+#endif
+
 	const bool was_static = !s_wifi_dhcp;
 
 	// Distinguishes the two ways phase 1 can fail, because they earn different
@@ -968,6 +1055,9 @@ static bool wifi_wait_connected()
 	bool static_suspect = false;
 
 	if (wifi_await(was_static ? WIFI_CONNECT_TIMEOUT_MS : WIFI_DHCP_TIMEOUT_MS)) {
+		if (!was_static) {
+			dhcp_lease_noted();
+		}
 		if (wifi_reachable()) {
 			wifi_cache_ap();
 			s_wifi_connected = true;
@@ -1055,6 +1145,7 @@ static bool wifi_wait_connected()
 		log_i("wifi: retrying on dhcp");
 
 		if (wifi_await(WIFI_DHCP_TIMEOUT_MS)) {
+			dhcp_lease_noted();
 			wifi_cache_ap();
 			if (!wifi_reachable()) {
 				// Not on a lease either, so the outage is upstream, as in
@@ -2175,10 +2266,17 @@ static_assert(framesize_pixels(CAM_FRAMESIZE) != 0,
 #define WIFI_UP_MAX_S     ((WIFI_CONNECT_TIMEOUT_MS + WIFI_DHCP_TIMEOUT_MS) / 1000 + \
                            2 * DNS_LOOKUP_MAX_S)
 #define CLIP_MAX_BYTES    (VIDEO_MAX_BYTES + TG_MULTIPART_MAX)
+// A failed hostname refresh ahead of the normal path, at most once a wake: a
+// lease that arrives at the deadline, then a DNS lookup that fails.
+#if DHCP_REFRESH_ENABLED
+#define DHCP_REFRESH_MAX_S (WIFI_DHCP_TIMEOUT_MS / 1000 + DNS_LOOKUP_MAX_S)
+#else
+#define DHCP_REFRESH_MAX_S 0
+#endif
 static_assert(framesize_pixels(VIDEO_FRAMESIZE) != 0 &&
               framesize_pixels(VIDEO_FRAMESIZE) <= 1280u * 720u,
               "VIDEO_FRAMESIZE must be HD or smaller (config.h)");
-static_assert(WAKE_DEADLINE_S > PIR_IDLE_MAX_S +
+static_assert(WAKE_DEADLINE_S > PIR_IDLE_MAX_S + DHCP_REFRESH_MAX_S +
                                 2 * (WIFI_UP_MAX_S +
                                      TG_POST_MAX_S(STILL_MAX_BYTES, TELEGRAM_MIN_BPS)) +
                                 VIDEO_MAX_CLIPS_PER_EPISODE *

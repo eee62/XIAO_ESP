@@ -433,6 +433,32 @@
 #define WIFI_HOSTNAME    "iPhone"
 #endif
 
+// Hostname refresh. The name reaches the router only in DHCP, and with no
+// admin access to the router there is no other way to name the node there.
+// So once this long has passed since the last lease (or since power-on), the
+// next wake that associates does it on DHCP instead of the static fast path,
+// exactly as the DHCP fallback below does. The lease alone is the refresh,
+// and that wake sends over it if TELEGRAM_HOST resolves on it; otherwise it
+// falls through to the normal path for that wake, unchanged. A refresh that
+// gets no lease within WIFI_DHCP_TIMEOUT_MS is still owed, and the first wake
+// that associates HOSTNAME_REFRESH_RETRY_S or more after it tries again. Any
+// lease counts, including one the DHCP fallback gets on a normal wake, and
+// restarts the HOSTNAME_REFRESH_INTERVAL_S clock. Wakes that are not refresh wakes
+// associate exactly as before. The capture is never affected: the radio
+// comes up only after it (9.1).
+//
+// Cost: a DHCP exchange in place of an instant static GOT_IP, ~0.5-3 s more
+// radio at ~250 mA (7), ~0.03-0.2 mAh a refresh, so ~0.03-0.2 mAh/day at
+// 24 h. A refresh that gets no lease costs the full WIFI_DHCP_TIMEOUT_MS,
+// ~0.56 mAh, and HOSTNAME_REFRESH_RETRY_S bounds how often that is paid while
+// DHCP stays broken: at most 86400 / HOSTNAME_REFRESH_RETRY_S failures a
+// day, 24 at 3600, ~13 mAh/day if the node associates at least hourly. It
+// associates only to send, at least every TELEMETRY_MAX_SILENCE_S, so a quiet
+// node pays ~2.2 mAh/day (four failures) and a day of visits more. 0 disables
+// the refresh.
+#define HOSTNAME_REFRESH_INTERVAL_S  86400
+#define HOSTNAME_REFRESH_RETRY_S     3600
+
 // NET_DNS matters more than it used to: 9.6 resolves api.telegram.org, so a
 // static config with a dead resolver now costs delivery, not just lookups.
 #define NET_STATIC_IP    192, 168, 1, 50
@@ -615,12 +641,15 @@
 //
 //       30 s  PIR_IDLE_MAX_S       D1 waited out before the idle sleep
 //                                  (main.cpp)
+//   +   29 s  8 + 21 s             a failed hostname refresh, once a wake
+//                                  (HOSTNAME_REFRESH_INTERVAL_S): a lease at
+//                                  WIFI_DHCP_TIMEOUT_MS that cannot resolve
 //   +  414 s  2 x (54 + 153 s)     two stills: an association and a
 //                                  tg_post() each
 //   +  771 s  3 x (30 + 54 + 173)  the clips: VIDEO_MAX_CLIP_S of recording,
 //                                  an association and a tg_post() of
 //                                  VIDEO_MAX_BYTES each
-//   = 1215 s
+//   = 1244 s
 //
 // An association is at most 54 s: WIFI_CONNECT_TIMEOUT_MS +
 // WIFI_DHCP_TIMEOUT_MS, and a DNS lookup in wifi_reachable() on the static
@@ -644,7 +673,7 @@
 // For a clip, B is VIDEO_MAX_BYTES plus the same, 82 s at the clip floor for
 // 5 MB: 46 + 30 + 82 + 15 = 173 s.
 //
-// 32 minutes leaves 705 s for what no single timeout bounds: two captures,
+// 32 minutes leaves 676 s for what no single timeout bounds: two captures,
 // ~10 s each at worst (init, CAM_WARMUP_MS, and two 4 s fb_get() timeouts when
 // a frame overflows its buffer), two detections of seconds each, and three
 // video bring-ups of about a second, each with up to two 4 s fb_get()
