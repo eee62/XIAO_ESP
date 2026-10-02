@@ -295,69 +295,100 @@
 // proven at 12.5 s and the first frame is ~13.6 s in (~0.25 s boot, ~0.55 s
 // power-up and cold init, VIDEO_WARMUP_MS). A 15 s visit therefore gets a
 // clip, catching its last ~1.4 s and then the VIDEO_END_QUIET_S tail after D1
-// falls at 17.5 s. A visitor who leaves before ~13.6 s is in the photos only.
-// (With the brief's 10 s hold it would be ~21 s, after a 15 s visitor left.)
+// falls at 17.5 s: ~7.9 s of clip in all, ~12.9 s for a 20 s visit. A visitor
+// who leaves before ~13.6 s is in the photos only. (With the brief's 10 s
+// hold it would be ~21 s, after a 15 s visitor left.)
 //
 // The person gate (VIDEO_REQUIRE_PERSON) keeps a branch in steady wind, which
 // can hold D1 high for minutes, from being filmed. If a photo earlier in the
 // episode held a person, the clip starts at once. If not, one fresh still is
-// taken and judged, at most once per episode: a person there is sent as a
-// photo (it counts toward PHOTOS_PER_EPISODE) and then the clip starts; no
-// person means no clip this episode. A trigger photo taken at the very moment
-// motion is proven serves as that fresh check. bench-nodetect has no detector
-// and records on the 10-second rule alone.
+// taken and judged, at most once per episode; no person means no clip this
+// episode. A person there starts the clip straight away: the still is held
+// in PSRAM through the recording and sent after it, before the clip's own
+// upload, so the visitor is filmed instead of waiting out an association and
+// an upload first. It counts toward PHOTOS_PER_EPISODE as any photo does. A
+// trigger photo taken at the very moment motion is proven serves as that
+// fresh check. bench-nodetect has no detector and records on the 10-second
+// rule alone.
 //
 // Recording stops at the first of: D1 low for VIDEO_END_QUIET_S, the clip
-// reaching VIDEO_MAX_CLIP_S, or the buffer filling. If it stopped on a cap
-// and D1 is still high once the clip is sent, another is recorded, up to
-// VIDEO_MAX_CLIPS_PER_EPISODE; a clip that fails to send ends clips for the
-// episode, since the next would be dropped too. PIR edges during recording
-// are the same visitor: they keep the clip going but are not triggers, and no
-// still is taken for them.
+// reaching VIDEO_MAX_CLIP_S, or the buffer filling. VIDEO_END_QUIET_S is
+// shorter than PRESENCE_GAP_S, so a clip that ends on quiet leaves the
+// episode open: it closes PRESENCE_GAP_S after D1 fell, and a visitor who
+// moves again before then is the same visit, whose new edge can start another
+// clip. If it stopped on a cap and D1 is still high once the clip is sent,
+// another is recorded. Either way, at most VIDEO_MAX_CLIPS_PER_EPISODE. A
+// clip that fails to send ends clips for the episode, since the next would be
+// dropped too. PIR edges during recording are the same visitor: they keep the
+// clip going but are not triggers, and no still is taken for them.
 //
 // The file is MJPEG in AVI (src/avi.cpp), built in one PSRAM buffer of
-// min(VIDEO_MAX_BYTES, largest free block - VIDEO_PSRAM_RESERVE), and sent
-// with sendDocument as clip.avi, video/x-msvideo. sendVideo wants MP4/H.264,
-// which is not worth encoding on the S3.
+// min(VIDEO_MAX_BYTES, free PSRAM - VIDEO_PSRAM_RESERVE, largest free block),
+// and sent with sendDocument as clip.avi, video/x-msvideo. sendVideo wants
+// MP4/H.264, which is not worth encoding on the S3.
 //
-// Buffer against time: SVGA JPEGs at VIDEO_JPEG_QUALITY 14 run ~35-75 kB, so
-// at 8 fps 4 MB lasts ~7-15 s. Most clips will end on "buffer full" and the
-// long-visit rule chains the next. Lower VIDEO_FPS or VIDEO_FRAMESIZE VGA
-// stretch it.
+// Buffer against time: VGA JPEGs at VIDEO_JPEG_QUALITY 12 should run
+// ~30-60 kB (SVGA at 14 was estimated at ~35-75 kB; VGA has 0.64 of the
+// pixels, and 12 is a little bigger than 14), 240-480 kB/s at 8 fps, so 5 MB
+// lasts ~11-22 s: the whole ~8-13 s clip of a 15-20 s visit even at the top
+// of that range, with the quiet tail. A frame over the driver's buffer
+// (w x h / 5, 61,440 bytes at VGA) is dropped by it, so record_clip()
+// coarsens the quality once, as capture() does for stills. These sizes are
+// estimates; deployment mode's test clip reports real ones.
+//
+// PSRAM, 8 MB. The worst case is the fresh check's still held through the
+// recording at its 983,040-byte maximum (CAM_FRAMESIZE). Allowing 128 kB for
+// everything else in PSRAM, and 256 kB for the WiFi driver and lwIP while
+// sending (CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP; mbedTLS allocates
+// internally), free PSRAM at each peak is:
+//   recording: clip buffer, still, two 61,440-byte VGA frame buffers
+//     8,388,608 - 131,072 - 983,040 - 122,880 - 5,242,880 = 1,908,736 (1.82 MB)
+//   sending the still: clip buffer, still, WiFi; frame buffers freed
+//     8,388,608 - 131,072 - 983,040 - 262,144 - 5,242,880 = 1,769,472 (1.69 MB)
+//   sending the clip: the still freed by then          2,752,512 (2.62 MB)
+// Keeping 1.5 MB free at both peaks allows a buffer of at most ~5.19 MB, so
+// 5 MB; 6 MB would leave ~0.69 MB while the still is sent. With no still held
+// (a person seen earlier in the visit) both peaks have ~2.6-2.8 MB free.
+// VIDEO_PSRAM_RESERVE holds the same margin at run time whatever the
+// allowances turn out to be: when less is free than budgeted, the buffer
+// shrinks, not the margin.
 //
 // Energy per clip, from the ~250 mA active figure in 7 (bench to confirm;
 // recording has the radio off, so 250 mA likely overstates that part):
 //   camera init and warm-up, ~1 s                          ~0.07 mAh
 //   recording, up to VIDEO_MAX_CLIP_S                      ~2.1 mAh at 30 s
-//   association, TLS, a 4 MB upload at ~200 kB/s (~24 s)   ~1.7 mAh
-//   total                                                  ~3.8 mAh
-// At the TELEGRAM_MIN_BPS floor the upload alone is ~18.5 mAh, ~20.6 mAh a
-// clip. The daily cap is what bounds this. VIDEO_MAX_CLIPS_PER_DAY 3 is
-// ~11.5 mAh on a day that reaches it (~62 mAh if every upload crawled at the
-// floor). That does NOT fit 7's ~9 mAh/day: 8.2 mAh of that is sleep, which
-// leaves ~0.8 mAh/day for everything else, less than one clip. No cap of one
-// or more fits. A node that hit this cap every day would draw ~20 mAh/day
-// and last ~5.5 months instead of ~a year; clips on only a few days a week
-// keep the average near budget.
+//   association, TLS, a 5 MB upload at ~200 kB/s (~29 s)   ~2.0 mAh
+//   total                                                  ~4.2 mAh
+// At the TELEGRAM_CLIP_MIN_BPS floor the upload alone is ~5.9 mAh (~85 s),
+// ~8.1 mAh a clip. The daily cap is what bounds this. VIDEO_MAX_CLIPS_PER_DAY
+// 3 is ~12.6 mAh on a day that reaches it (~24 mAh if every upload crawled at
+// the floor). That does NOT fit 7's ~9 mAh/day: 8.2 mAh of that is sleep,
+// which leaves ~0.8 mAh/day for everything else, less than one clip. No cap
+// of one or more fits. A node that hit this cap every day would draw
+// ~22 mAh/day (~33 at the floor) and last ~5 months (~3.4 at the floor)
+// instead of ~a year; clips on only a few days a week keep the average near
+// budget.
 // ---------------------------------------------------------------------------
 #define VIDEO_ENABLED                1
 #define VIDEO_PRESENCE_MIN_S         10
 #define VIDEO_REQUIRE_PERSON         1
 // Never above HD, the usual limit for M-JPEG playback on phones; main.cpp
 // checks it.
-#define VIDEO_FRAMESIZE              FRAMESIZE_SVGA
+#define VIDEO_FRAMESIZE              FRAMESIZE_VGA
 #define VIDEO_FPS                    8
-#define VIDEO_JPEG_QUALITY           14
+#define VIDEO_JPEG_QUALITY           12
 // Short: a clip wants to start, and a clip's first frames going slightly off
 // in colour cost less than the moment they would miss.
 #define VIDEO_WARMUP_MS              300
-#define VIDEO_END_QUIET_S            10
+#define VIDEO_END_QUIET_S            4
 #define VIDEO_MAX_CLIP_S             30
-#define VIDEO_MAX_BYTES              (4 * 1024 * 1024)
-// Left free beside the clip buffer for the send that follows: TLS, lwIP and
-// the WiFi driver allocate some of theirs in PSRAM in the detect builds
-// (CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP).
-#define VIDEO_PSRAM_RESERVE          (512 * 1024)
+#define VIDEO_MAX_BYTES              (5 * 1024 * 1024)
+// Free PSRAM left once the clip buffer is allocated: the 1.5 MB margin plus
+// the 256 kB the send that follows may allocate there in the detect builds
+// (lwIP and the WiFi driver's buffers, CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP).
+// Counted against all free PSRAM, not the largest block: the margin is free
+// memory wherever it lies. See the PSRAM budget above.
+#define VIDEO_PSRAM_RESERVE          ((1536 + 256) * 1024)
 #define VIDEO_MAX_CLIPS_PER_EPISODE  3
 // In any rolling 24 hours, by now_s(); a clip counts, by its start time, once
 // it has actually been recorded. See the energy note above.
@@ -390,6 +421,16 @@
 #endif
 #ifndef WIFI_PASSWORD
 #define WIFI_PASSWORD    "CHANGEME"
+#endif
+
+// The station's DHCP hostname, set before every association (main.cpp,
+// wifi_set_hostname()). It is what the router's client list shows for a
+// DHCP lease; on the static-address fast path nothing is sent that carries
+// it. Overridable from include/secrets.h, as DEPLOY_AP_SSID is. Not to be
+// confused with DEPLOY_AP_SSID: that names deployment mode's own access
+// point, this names the node as a client of someone else's.
+#ifndef WIFI_HOSTNAME
+#define WIFI_HOSTNAME    "iPhone"
 #endif
 
 // NET_DNS matters more than it used to: 9.6 resolves api.telegram.org, so a
@@ -481,11 +522,17 @@
 // 7 mAh for that still, so the floor is an energy decision as much as a
 // patience one. The camera is off throughout (9.1 step 5).
 //
+// Clips have their own floor, TELEGRAM_CLIP_MIN_BPS. At 16 kB/s a 5 MB clip
+// would be allowed 30 + 328 s of radio, ~25 mAh; at 64 kB/s it is 30 + 82 s,
+// and a link too slow for that drops the clip rather than the battery. The
+// still floor stays at 16 kB/s, where a still is worth the wait.
+//
 // A cold TLS handshake on an ESP32-S3 is 1-3 s by itself; TELEGRAM_HANDSHAKE_S
 // bounds it.
 #define TELEGRAM_STALL_MS         15000
 #define TELEGRAM_POST_BASE_S      30
 #define TELEGRAM_MIN_BPS          16000
+#define TELEGRAM_CLIP_MIN_BPS     64000
 #define TELEGRAM_HANDSHAKE_S      10
 
 // Chain validation off by default. See 9.6 for the reasoning: a node that may
@@ -561,18 +608,19 @@
 // sleeps, so it is never on the clock.
 //
 // This has to sit above the longest wake that is slow but not hung. That is
-// a presence-video wake: a trigger photo, the video gate's fresh still, then
-// VIDEO_MAX_CLIPS_PER_EPISODE clips, each recorded and sent before the next.
-// Every term is a timeout or a cap in the code:
+// a presence-video wake: a trigger photo, the video gate's fresh still (sent
+// after the first clip is recorded), then VIDEO_MAX_CLIPS_PER_EPISODE clips,
+// each recorded and sent before the next. Every term is a timeout or a cap
+// in the code:
 //
 //       30 s  PIR_IDLE_MAX_S       D1 waited out before the idle sleep
 //                                  (main.cpp)
 //   +  414 s  2 x (54 + 153 s)     two stills: an association and a
 //                                  tg_post() each
-//   + 1314 s  3 x (30 + 54 + 354)  the clips: VIDEO_MAX_CLIP_S of recording,
+//   +  771 s  3 x (30 + 54 + 173)  the clips: VIDEO_MAX_CLIP_S of recording,
 //                                  an association and a tg_post() of
 //                                  VIDEO_MAX_BYTES each
-//   = 1758 s
+//   = 1215 s
 //
 // An association is at most 54 s: WIFI_CONNECT_TIMEOUT_MS +
 // WIFI_DHCP_TIMEOUT_MS, and a DNS lookup in wifi_reachable() on the static
@@ -586,19 +634,21 @@
 //      46 s  the connect: TELEGRAM_HOST resolved again (21 s; a cache hit
 //            only while the record's TTL lasts), the TCP connect
 //            (TELEGRAM_STALL_MS) and TELEGRAM_HANDSHAKE_S
-//   +  TELEGRAM_POST_BASE_S + B / TELEGRAM_MIN_BPS, the upload cap
+//   +  TELEGRAM_POST_BASE_S + B / floor, the upload cap, where the floor is
+//            TELEGRAM_MIN_BPS for a still, TELEGRAM_CLIP_MIN_BPS for a clip
 //   +  15 s  one TELEGRAM_STALL_MS past the cap: the cap is checked between
 //            writes, and a write returns only on progress or a full stall
 // For a still, B is the driver's frame buffer at CAM_FRAMESIZE (w x h / 5; a
 // bigger frame never reaches PSRAM) plus 1.5 kB of multipart head and tail.
 // At QSXGA that is 985 kB, 62 s at the floor rate: 46 + 30 + 62 + 15 = 153 s.
-// For a clip, B is VIDEO_MAX_BYTES plus the same, 263 s at the floor rate for
-// 4 MB: 46 + 30 + 263 + 15 = 354 s.
+// For a clip, B is VIDEO_MAX_BYTES plus the same, 82 s at the clip floor for
+// 5 MB: 46 + 30 + 82 + 15 = 173 s.
 //
-// 32 minutes leaves 162 s for what no single timeout bounds: two captures,
+// 32 minutes leaves 705 s for what no single timeout bounds: two captures,
 // ~10 s each at worst (init, CAM_WARMUP_MS, and two 4 s fb_get() timeouts when
 // a frame overflows its buffer), two detections of seconds each, and three
-// video bring-ups of about a second. main.cpp checks the sum at compile time,
+// video bring-ups of about a second, each with up to two 4 s fb_get()
+// timeouts of its own (record_clip()). main.cpp checks the sum at compile time,
 // so retuning a term past this fails the build instead of cutting slow wakes
 // short. It stays one deadline for the whole wake: under 45 minutes,
 // re-arming it per phase buys too little to be worth the complication. A hang

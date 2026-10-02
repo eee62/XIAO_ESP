@@ -28,10 +28,13 @@ bool telegram_configured();
 // (sendPhoto, sendDocument), `field` the form field it expects the file in
 // (photo, document). `caption` may be empty. The payload is streamed from
 // where it lies, between a small head and tail, never copied; Content-Length
-// is known up front. Returns true only on an HTTP 2xx from the API.
+// is known up front. `min_bps` is the slowest upload allowed to finish
+// (config.h, TELEGRAM_MIN_BPS / TELEGRAM_CLIP_MIN_BPS). Returns true only on
+// an HTTP 2xx from the API.
 bool telegram_send_file(const char *method, const char *field,
                         const char *filename, const char *content_type,
-                        const uint8_t *data, size_t len, const String &caption);
+                        const uint8_t *data, size_t len, const String &caption,
+                        uint32_t min_bps);
 
 // Upload one JPEG still: sendDocument with the original bytes, or sendPhoto
 // (which Telegram recompresses) when TELEGRAM_STILL_AS_DOCUMENT is 0.

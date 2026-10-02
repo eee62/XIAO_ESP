@@ -41,8 +41,9 @@ bool telegram_configured()
 //     the watching: connect() stores its timeout as the socket timeout, and
 //     send_ssl_data() fails a write that makes no progress for that long;
 //   - a cap on the whole upload and reply, TELEGRAM_POST_BASE_S plus
-//     Content-Length / TELEGRAM_MIN_BPS, counted from the TLS session being
-//     up. The connect has its own bounds: DNS, the TCP connect (also
+//     Content-Length / `min_bps`, counted from the TLS session being up.
+//     `min_bps` is the caller's floor: TELEGRAM_MIN_BPS for a still or a
+//     message, TELEGRAM_CLIP_MIN_BPS for a clip. The connect has its own bounds: DNS, the TCP connect (also
 //     TELEGRAM_STALL_MS) and TELEGRAM_HANDSHAKE_S.
 // ---------------------------------------------------------------------------
 struct tg_seg_t {
@@ -51,7 +52,7 @@ struct tg_seg_t {
 };
 
 static bool tg_post(const char *method, const char *content_type,
-                    const tg_seg_t *segs, int nsegs)
+                    const tg_seg_t *segs, int nsegs, uint32_t min_bps)
 {
 	if (!telegram_configured()) {
 		log_e("telegram: no token/chat_id compiled in (see include/secrets.h)");
@@ -81,7 +82,7 @@ static bool tg_post(const char *method, const char *content_type,
 	}
 	const uint32_t t0 = millis();
 	const uint32_t cap_ms = (uint32_t)TELEGRAM_POST_BASE_S * 1000u +
-	                        (uint32_t)((uint64_t)body_len * 1000u / TELEGRAM_MIN_BPS);
+	                        (uint32_t)((uint64_t)body_len * 1000u / min_bps);
 	log_i("telegram: TLS up in %lu ms; %u bytes, allowed %lu s",
 	      (unsigned long)(t0 - t_connect), (unsigned)body_len,
 	      (unsigned long)(cap_ms / 1000));
@@ -208,7 +209,8 @@ static bool tg_post(const char *method, const char *content_type,
 		log_e("telegram: %s -> HTTP %d %s", method, code, reply);
 	} else {
 		// Upload rate is the number to watch on a weak link: it is what
-		// TELEGRAM_MIN_BPS has to stay under.
+		// the floor (TELEGRAM_MIN_BPS, TELEGRAM_CLIP_MIN_BPS) has to stay
+		// under.
 		log_i("telegram: %s ok (%u bytes, upload %lu ms, %lu B/s, total %lu ms)",
 		      method, (unsigned)body_len, (unsigned long)up_ms,
 		      (unsigned long)(up_ms ? (uint64_t)body_len * 1000u / up_ms : 0),
@@ -237,7 +239,8 @@ static void append_field(String &s, const char *name, const char *value)
 
 bool telegram_send_file(const char *method, const char *field,
                         const char *filename, const char *content_type,
-                        const uint8_t *data, size_t len, const String &caption)
+                        const uint8_t *data, size_t len, const String &caption,
+                        uint32_t min_bps)
 {
 	if (!data || len == 0) {
 		return false;
@@ -269,7 +272,7 @@ bool telegram_send_file(const char *method, const char *field,
 		{(const uint8_t *)TAIL, sizeof(TAIL) - 1},
 	};
 	return tg_post(method, "multipart/form-data; boundary=" TELEGRAM_BOUNDARY,
-	               segs, 3);
+	               segs, 3, min_bps);
 }
 
 bool telegram_send_photo(const uint8_t *jpeg, size_t len, const String &caption)
@@ -280,10 +283,10 @@ bool telegram_send_photo(const uint8_t *jpeg, size_t len, const String &caption)
 	// A departure from 9.6, which names sendPhoto; set
 	// TELEGRAM_STILL_AS_DOCUMENT to 0 for the brief's behaviour.
 	return telegram_send_file("sendDocument", "document", "capture.jpg",
-	                          "image/jpeg", jpeg, len, caption);
+	                          "image/jpeg", jpeg, len, caption, TELEGRAM_MIN_BPS);
 #else
 	return telegram_send_file("sendPhoto", "photo", "capture.jpg",
-	                          "image/jpeg", jpeg, len, caption);
+	                          "image/jpeg", jpeg, len, caption, TELEGRAM_MIN_BPS);
 #endif
 }
 
@@ -305,5 +308,6 @@ bool telegram_send_message(const String &text)
 
 	const tg_seg_t seg = {(const uint8_t *)body.c_str(), body.length()};
 	return tg_post("sendMessage",
-	               "multipart/form-data; boundary=" TELEGRAM_BOUNDARY, &seg, 1);
+	               "multipart/form-data; boundary=" TELEGRAM_BOUNDARY, &seg, 1,
+	               TELEGRAM_MIN_BPS);
 }

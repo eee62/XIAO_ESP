@@ -838,6 +838,23 @@ static void wifi_ip_config(bool dhcp)
 	}
 }
 
+// Station hostname (config.h, WIFI_HOSTNAME), before every association. In
+// core 3.3.11 WiFi.setHostname() only stores the name
+// (NetworkManager::setHostname()); WiFiGenericClass::mode() writes it to the
+// STA netif with esp_netif_set_hostname() when it switches STA on, before
+// esp_wifi_set_mode(). Both begin() paths below switch it on: wifi_down() and
+// disconnect(true, ...) turn STA off, and the WiFi.mode() or WiFi.config()
+// that follows turns it back on, which also starts the DHCP client that sends
+// the name. An STA already on has no such switch, so the name is written to
+// its netif directly as well.
+static void wifi_set_hostname()
+{
+	WiFi.setHostname(WIFI_HOSTNAME);
+	if ((WiFi.getMode() & WIFI_MODE_STA) && !WiFi.STA.setHostname(WIFI_HOSTNAME)) {
+		log_w("wifi: could not set hostname %s", WIFI_HOSTNAME);
+	}
+}
+
 // Kick off association and return without waiting. Idempotent, so the callers
 // that start the radio early and the send path that needs it can both call it.
 static void wifi_begin_async()
@@ -858,6 +875,7 @@ static void wifi_begin_async()
 #endif
 
 	WiFi.persistent(false);
+	wifi_set_hostname();
 	WiFi.mode(WIFI_STA);
 	WiFi.setSleep(WIFI_PS_NONE);
 	wifi_ip_config(s_wifi_dhcp);
@@ -1024,6 +1042,7 @@ static bool wifi_wait_connected()
 		delay(10);
 
 		s_wifi_dhcp = true;
+		wifi_set_hostname();
 		wifi_ip_config(true);
 
 		if (rtc_have_ap) {
@@ -1564,6 +1583,7 @@ struct clip_t {
 	float      fps;
 	clip_end_t end;
 	int        pir_edges;   // rising edges while recording: same visitor
+	uint64_t   d1_fall_ms;  // CLIP_END_QUIET: now_ms() when D1 fell
 };
 
 // Record one clip with the radio off, and cut the camera before returning
@@ -1578,22 +1598,30 @@ static bool record_clip(clip_t *out, uint32_t max_s, bool follow_pir)
 		return false;
 	}
 
-	// Sized after the camera has taken its own two frame buffers, so they
-	// are already out of the largest free block.
+	// Sized after the camera has taken its own two frame buffers, and with a
+	// held fresh-check still (video_run()) already in PSRAM, so both are out
+	// of what is free. VIDEO_PSRAM_RESERVE is kept free in all, wherever it
+	// lies; the largest block only says how big one allocation can be.
+	const size_t free_b  = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
 	const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
-	size_t cap = largest > (size_t)VIDEO_PSRAM_RESERVE ? largest - VIDEO_PSRAM_RESERVE : 0;
+	size_t cap = free_b > (size_t)VIDEO_PSRAM_RESERVE ? free_b - VIDEO_PSRAM_RESERVE : 0;
+	if (cap > largest) {
+		cap = largest;
+	}
 	if (cap > (size_t)VIDEO_MAX_BYTES) {
 		cap = VIDEO_MAX_BYTES;
 	}
 	uint8_t *buf = cap >= 64 * 1024 ? (uint8_t *)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM)
 	                                : nullptr;
 	if (!buf) {
-		log_e("clip: no PSRAM for a buffer (largest free block %u)", (unsigned)largest);
+		log_e("clip: no PSRAM for a buffer (%u free, largest block %u)",
+		      (unsigned)free_b, (unsigned)largest);
 		camera_down();
 		return false;
 	}
-	log_i("clip: %u-byte buffer, largest free PSRAM block was %u",
-	      (unsigned)cap, (unsigned)largest);
+	log_i("clip: %u-byte buffer; PSRAM free %u before it, %u after, largest "
+	      "block was %u", (unsigned)cap, (unsigned)free_b,
+	      (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), (unsigned)largest);
 
 	// Frames are taken on a VIDEO_FPS schedule from the sensor's faster
 	// stream (GRAB_LATEST hands over the newest), the first no earlier than
@@ -1606,10 +1634,22 @@ static bool record_clip(clip_t *out, uint32_t max_s, bool follow_pir)
 	uint32_t t_first   = 0;
 	uint32_t low_since = 0;
 	bool     was_high  = gpio_get_level(PIN_PIR) == 1;
+	bool     raised    = false;
 	clip_end_t end     = CLIP_END_TIME;
 	for (;;) {
 		camera_fb_t *fb = esp_camera_fb_get();
 		if (!fb) {
+			// Most likely every frame outgrowing the driver's buffer (config.h,
+			// VIDEO_FRAMESIZE): coarser by CAM_QUALITY_STEP, once, as capture()
+			// does. The schedule carries on; the gap is the 4 s timeout.
+			sensor_t *s = esp_camera_sensor_get();
+			const int q2 = VIDEO_JPEG_QUALITY + CAM_QUALITY_STEP;
+			if (!raised && q2 <= 63 && s && s->set_quality(s, q2) == 0) {
+				log_w("clip: no frame at JPEG quality %d; carrying on at %d",
+				      VIDEO_JPEG_QUALITY, q2);
+				raised = true;
+				continue;
+			}
 			end = CLIP_END_CAMERA;
 			break;
 		}
@@ -1650,6 +1690,7 @@ static bool record_clip(clip_t *out, uint32_t max_s, bool follow_pir)
 				low_since = now | 1;
 			} else if (now - low_since >= (uint32_t)VIDEO_END_QUIET_S * 1000u) {
 				end = CLIP_END_QUIET;
+				out->d1_fall_ms = now_ms() - (millis() - low_since);
 				break;
 			}
 		}
@@ -1700,7 +1741,8 @@ static bool send_clip(const clip_t &c)
 			rtc_clips_sent_since_report++;
 			const String cap = telemetry_text(why.c_str(), 0.0f, 0, 0);
 			ok = telegram_send_file("sendDocument", "document", "clip.avi",
-			                        "video/x-msvideo", c.buf, c.len, cap);
+			                        "video/x-msvideo", c.buf, c.len, cap,
+			                        TELEGRAM_CLIP_MIN_BPS);
 			if (!ok) {
 				rtc_clips_sent_total--;
 				rtc_clips_sent_since_report--;
@@ -1736,9 +1778,11 @@ static int clips_last_day()
 
 #if VIDEO_REQUIRE_PERSON
 // The gate's one fresh still for an episode with no person seen yet (config.h,
-// VIDEO_REQUIRE_PERSON): a person there is sent as a photo and lets the clip
-// start; otherwise the episode gets no clip.
-static void fresh_check()
+// VIDEO_REQUIRE_PERSON): a person there lets the clip start; otherwise the
+// episode gets no clip. The person photo is not sent here but handed back in
+// *held, for video_run() to send once the clip is recorded: the visitor is
+// filmed first, not after an association and an upload.
+static void fresh_check(frame_t *held)
 {
 	rtc_ep.fresh_checked = true;
 	log_i("no person seen this visit yet: one fresh check");
@@ -1760,12 +1804,10 @@ static void fresh_check()
 		rtc_ep.person     = EP_PERSON_YES;
 		rtc_wind_streak   = 0;
 		rtc_backoff_level = 0;
-		// Sent before the clip, so the upload finishes before recording
-		// starts and the photo is not lost to a clip that fills PSRAM.
-		if (rtc_ep.photos_sent < PHOTOS_PER_EPISODE &&
-		    send_photo(f, "person (10 s check)")) {
-			rtc_ep.photos_sent++;
-		}
+		// record_clip() sizes its buffer around this still, so it cannot
+		// be lost to a clip that fills PSRAM.
+		*held  = f;
+		f.data = nullptr;
 	} else {
 		rtc_ep.person = EP_PERSON_NO;
 		if (rtc_wind_streak < 255) {
@@ -1779,9 +1821,26 @@ static void fresh_check()
 }
 #endif
 
+// Send the fresh check's person photo that video_run() was handed, if it has
+// not gone yet, and free it.
+static void send_held_still(frame_t *held)
+{
+	if (!held || !held->data) {
+		return;
+	}
+	if (rtc_ep.photos_sent < PHOTOS_PER_EPISODE &&
+	    send_photo(*held, "person (10 s check)")) {
+		rtc_ep.photos_sent++;
+	}
+	heap_caps_free(held->data);
+	held->data = nullptr;
+}
+
 // Clips for as long as the visit and the caps allow, each sent before the
-// next is recorded.
-static void video_run()
+// next is recorded. `held` is the fresh check's person photo, or nullptr: it
+// goes out once the first clip is recorded, ahead of that clip's upload, or
+// on the way out if no clip is.
+static void video_run(frame_t *held)
 {
 	for (;;) {
 		if (rtc_ep.clips >= VIDEO_MAX_CLIPS_PER_EPISODE ||
@@ -1789,12 +1848,14 @@ static void video_run()
 			log_i("clip caps reached (%u this visit, %d in 24 h)", rtc_ep.clips,
 			      clips_last_day());
 			rtc_ep.video_done = true;
+			send_held_still(held);
 			return;
 		}
 		const uint32_t t_start = now_s();
 		clip_t c;
 		if (!record_clip(&c, VIDEO_MAX_CLIP_S, true)) {
 			rtc_ep.video_done = true;
+			send_held_still(held);
 			return;
 		}
 		// Counted against the caps once something was actually recorded.
@@ -1803,6 +1864,9 @@ static void video_run()
 		rtc_ep.clips++;
 		rtc_clip_ms_total        += c.dur_ms;
 		rtc_clip_ms_since_report += c.dur_ms;
+		// The still first: smaller, so it lands before the clip, and whatever
+		// happens to the clip's upload.
+		send_held_still(held);
 		const bool sent = send_clip(c);
 		heap_caps_free(c.buf);
 
@@ -1813,9 +1877,13 @@ static void video_run()
 			return;
 		}
 		if (c.end == CLIP_END_QUIET) {
-			// D1 low for VIDEO_END_QUIET_S is longer than PRESENCE_GAP_S: the
-			// visit is over.
-			episode_close("D1 quiet during a clip");
+			// D1 fell VIDEO_END_QUIET_S before the clip ended, which is less
+			// than PRESENCE_GAP_S: the visit may not be over. The episode runs
+			// on from the real fall, and closes once the gap has passed since
+			// then; a new edge before that is this visitor again. If D1 rose
+			// during the upload, the level wake fires at once and sees it.
+			rtc_ep.d1_high = false;
+			rtc_ep.fall_ms = c.d1_fall_ms;
 			return;
 		}
 		if (gpio_get_level(PIN_PIR) == 0) {
@@ -1853,6 +1921,7 @@ static void video_check(bool edge, bool judged)
 		rtc_ep.video_done = true;
 		return;
 	}
+	frame_t held = {};   // the fresh check's person photo, sent by video_run()
 #if VIDEO_REQUIRE_PERSON
 	if (rtc_ep.person != EP_PERSON_YES) {
 		if (judged && by_edge) {
@@ -1862,7 +1931,7 @@ static void video_check(bool edge, bool judged)
 			rtc_ep.fresh_checked = true;
 		}
 		if (!rtc_ep.fresh_checked) {
-			fresh_check();
+			fresh_check(&held);
 		}
 		if (rtc_ep.person != EP_PERSON_YES) {
 			log_i("no person confirmed this visit; no clip");
@@ -1873,7 +1942,7 @@ static void video_check(bool edge, bool judged)
 #else
 	(void)judged;
 #endif
-	video_run();
+	video_run(&held);
 #else
 	(void)edge;
 	(void)judged;
@@ -2096,10 +2165,10 @@ static_assert(framesize_pixels(CAM_FRAMESIZE) != 0,
 // Multipart head (chat_id, a caption cut to 1000 bytes, the file part's
 // headers) and tail, rounded up.
 #define TG_MULTIPART_MAX  1536
-// One tg_post() of `bytes`, the rate term rounded up.
-#define TG_POST_MAX_S(bytes) (TG_CONNECT_MAX_S + TELEGRAM_POST_BASE_S +          \
-                              ((bytes) + TELEGRAM_MIN_BPS - 1) / TELEGRAM_MIN_BPS + \
-                              TELEGRAM_STALL_MS / 1000)
+// One tg_post() of `bytes` with the floor `bps`, the rate term rounded up.
+#define TG_POST_MAX_S(bytes, bps) (TG_CONNECT_MAX_S + TELEGRAM_POST_BASE_S + \
+                                   ((bytes) + (bps) - 1) / (bps) +           \
+                                   TELEGRAM_STALL_MS / 1000)
 // The driver's JPEG buffer (cam_hal.c, FRAME_SIZE_AUTO) bounds a still.
 #define STILL_MAX_BYTES   (framesize_pixels(CAM_FRAMESIZE) / 5 + TG_MULTIPART_MAX)
 // One association, both phases, worst case.
@@ -2110,10 +2179,11 @@ static_assert(framesize_pixels(VIDEO_FRAMESIZE) != 0 &&
               framesize_pixels(VIDEO_FRAMESIZE) <= 1280u * 720u,
               "VIDEO_FRAMESIZE must be HD or smaller (config.h)");
 static_assert(WAKE_DEADLINE_S > PIR_IDLE_MAX_S +
-                                2 * (WIFI_UP_MAX_S + TG_POST_MAX_S(STILL_MAX_BYTES)) +
+                                2 * (WIFI_UP_MAX_S +
+                                     TG_POST_MAX_S(STILL_MAX_BYTES, TELEGRAM_MIN_BPS)) +
                                 VIDEO_MAX_CLIPS_PER_EPISODE *
                                     (VIDEO_MAX_CLIP_S + WIFI_UP_MAX_S +
-                                     TG_POST_MAX_S(CLIP_MAX_BYTES)),
+                                     TG_POST_MAX_S(CLIP_MAX_BYTES, TELEGRAM_CLIP_MIN_BPS)),
               "WAKE_DEADLINE_S no longer covers the longest normal wake (config.h)");
 
 // Never stopped: every path after setup() arms it ends in deep sleep, which
