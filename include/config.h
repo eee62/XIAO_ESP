@@ -451,13 +451,14 @@
 // radio at ~250 mA (7), ~0.03-0.2 mAh a refresh, so ~0.03-0.2 mAh/day at
 // 24 h. A refresh that gets no lease costs the full WIFI_DHCP_TIMEOUT_MS,
 // ~0.56 mAh, and HOSTNAME_REFRESH_RETRY_S bounds how often that is paid while
-// DHCP stays broken: at most 86400 / HOSTNAME_REFRESH_RETRY_S failures a
-// day, 24 at 3600, ~13 mAh/day if the node associates at least hourly. It
-// associates only to send, at least every TELEMETRY_MAX_SILENCE_S, so a quiet
-// node pays ~2.2 mAh/day (four failures) and a day of visits more. 0 disables
-// the refresh.
+// DHCP stays broken: at most one failure per HOSTNAME_REFRESH_RETRY_S. At
+// 6 h that is four a day, ~2.2 mAh/day at worst, however often the node
+// associates: the same as the four telemetry wakes (TELEMETRY_MAX_SILENCE_S)
+// a quiet node has anyway, so a day of visits costs no more than a quiet day.
+// The price is a name that reaches the router up to 6 h later once DHCP is
+// back. 0 disables the refresh.
 #define HOSTNAME_REFRESH_INTERVAL_S  86400
-#define HOSTNAME_REFRESH_RETRY_S     3600
+#define HOSTNAME_REFRESH_RETRY_S     21600
 
 // NET_DNS matters more than it used to: 9.6 resolves api.telegram.org, so a
 // static config with a dead resolver now costs delivery, not just lookups.
