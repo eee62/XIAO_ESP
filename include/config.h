@@ -57,6 +57,19 @@
 // and leaves the high untouched. The internal pull is too strong for the job.
 #define PIR_INTERNAL_PULLDOWN  0
 
+// Sleep current with the radar. PROJECT_BRIEF.md 7 is now STALE and has to be
+// updated by hand: its sleep table has the AM312 at ~15 uA, and the LD2410S
+// draws ~45 uA at its minimum refresh rate (the setting tools/radar_config.py
+// writes; a faster refresh draws more, and these figures then no longer hold).
+//   ESP32-S3 deep sleep + Sense board baseline   ~64 uA   (7, unchanged)
+//   R9 leak into the gated camera               ~260 uA   (7, unchanged)
+//   LD2410S at minimum refresh                   ~45 uA   (7 has AM312 ~15 uA)
+//   total sleeping                              ~370 uA   (7 has ~340 uA)
+// That is ~8.9 mAh/day before a single wake, up from ~8.2, and 3400 mAh of
+// sleep alone lasts ~380 days, not ~415. 11 step 5's bench figure moves the
+// same way: expect ~370 uA, not ~340. The sleep figures in this file use
+// ~370; where they cite 7 for it, read 7 as corrected here.
+
 // PROJECT_BRIEF.md 5: HIGH = NPN conducts = FET on = camera powered.
 // LOW or floating = camera unpowered. Off is the deep-sleep/boot/reset
 // default and MUST NOT be inverted.
@@ -425,8 +438,8 @@
 //
 // Energy, from the ~250 mA active figure in 7 (bench to confirm; recording has
 // the radio off, so 250 mA likely overstates that part). None of it includes
-// the radar's own standing draw: 7's ~340 uA sleep total is the AM312 build
-// (15 uA), and the LD2410S is not in the brief.
+// sleep, which is ~370 uA with the radar (Sleep current, under Pins), not 7's
+// ~340 uA AM312 build.
 //   entry photo, judged and sent: boot, cold init, warm-up and a frame ~0.12,
 //     detection ~0.04, association + TLS + a QSXGA upload ~0.4-0.55  ~0.6-0.7 mAh
 //   entry photo, judged and dropped (no person)                      ~0.16-0.2 mAh
@@ -446,9 +459,9 @@
 // uploading. The fuse bounds clips, not minutes: 30 clips span ~30 min awake at
 // ~200 kB/s and ~58 min at the floor.
 //
-// Against 7's ~9 mAh/day, 8.2 of it sleep, which leaves ~0.8 mAh/day for
-// everything else: one short visit costs 3-4 times that allowance, so a day with
-// a visit overspends it. A fuse day is ~127 + 8.2 = ~135 mAh (~252 at the
+// Against 7's ~9 mAh/day: sleep alone is now ~8.9 of it with the radar (was
+// 8.2), which leaves almost nothing for everything else, so any day with a
+// visit overspends it. A fuse day is ~127 + 8.9 = ~136 mAh (~253 at the
 // floor): 15 days (28) of 7's budget in one, ~4% (~7%) of the cell. A node that
 // hit the fuse every day would last ~25 days (~13), not a year. The old limits
 // (3 clips a visit, 3 a day) held that worst case near 22 mAh/day (~33 at the
@@ -676,7 +689,7 @@
 //                 |
 //                 +-- 100 nF - GND
 //
-// ~2 uA is under 1% of the ~340 uA sleep budget in 7. The 100 nF is not
+// ~2 uA is under 1% of the ~370 uA sleep total (Sleep current, under Pins). The 100 nF is not
 // optional: the divider is a 500 k source, far too weak to charge the ADC's
 // sampling capacitor during a conversion, so the capacitor is what the ADC
 // actually samples.
