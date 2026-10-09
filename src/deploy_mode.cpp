@@ -36,9 +36,10 @@
 
 #define MJPEG_BOUNDARY "wildlifeframe"
 
-// How often deploy_mode_service() runs. Also the PIR sampling interval — the
-// AM312 holds its output for ~10 s, so this is three orders of magnitude
-// faster than it needs to be.
+// How often deploy_mode_service() runs. Also the presence sampling interval —
+// the radar holds OT2 for RADAR_UNMANNED_DELAY_S (10 s at the least) after the
+// last presence, so this is three orders of magnitude faster than it needs to
+// be.
 #define SERVICE_TICK_MS 10
 
 // A deferred action cannot run inside a request handler: the response has to
@@ -348,6 +349,7 @@ static String status_json()
 	j += ",\"pir_edges\":";     j += g_pir_edges;
 	j += ",\"pir_last\":";      j += g_pir_last_edge_s;
 	j += ",\"pir_high_ms\":";   j += g_pir_high_ms;
+	j += ",\"unmanned_s\":";    j += RADAR_UNMANNED_DELAY_S;
 	j += ",\"vbat_mv\":";       j += battery_mv();
 	j += ",\"trig_total\":";    j += s.triggers_total;
 	j += ",\"trig_since\":";    j += s.triggers_since_report;
@@ -708,7 +710,8 @@ function render(d){
     ' this session<br>'+(d.pir_edges?('last '+dur(d.uptime-d.pir_last)+' ago'):
     'walk-test the field of view')+
     (d.pir_high_ms?'<br>last high '+(d.pir_high_ms/1000).toFixed(1)+
-    ' s (one brief pass = the sensor hold time)':'');
+    ' s (one brief pass = the radar\'s unmanned delay; config.h expects '+
+    d.unmanned_s+' s)':'');
 
   rows=[];
   row('Uptime',dur(d.uptime));

@@ -261,11 +261,24 @@
 // back within the gap gets no second photo and does not lose the recording.
 #define PRESENCE_GAP_S         8
 
-// There is no PIR_HOLD_S. Its one reader was the 10-second rule's motion proof,
-// which is gone. The sensor's own hold after the last presence (the radar's
-// unmanned delay, a setting on the LD2410S) is inside OT2 and lengthens every
-// clip's tail by that long on top of VIDEO_END_QUIET_S. Deployment mode's walk
-// test still shows how long D1 stayed high after one brief wave.
+// The radar's unmanned delay: how long OT2 stays high after the last presence
+// the LD2410S sees. It replaces the AM312's fixed ~10 s output pulse (1, and
+// 12's note on it) and the PIR_HOLD_S that once modelled it.
+//
+// This constant does not set anything. The delay is a parameter stored in the
+// radar itself, written once over its UART by tools/radar_config.py; the
+// firmware never talks to the radar. So this only tells the firmware what the
+// radar was given, and it MUST match it: run the tool with the same value
+// (it reads this line for its default). 10 is the datasheet's minimum.
+//
+// What it lengthens or bounds:
+//   - every clip's tail: OT2 falls this long after the person leaves, and the
+//     clip runs on VIDEO_END_QUIET_S past that (Presence video, below)
+//   - PIR_IDLE_MAX_S (main.cpp), the wait for D1 to fall before the idle
+//     sleep, is derived from it so that it always outlasts it
+// Deployment mode's walk test measures it: "last high" after one brief pass,
+// walking right out of the radar's range, should read about this.
+#define RADAR_UNMANNED_DELAY_S 10
 
 // Wind backoff. A branch in wind retriggers the PIR all day and never holds
 // a person. After WIND_STREAK_BACKOFF photos in a row judged "no person", the
@@ -336,8 +349,9 @@
 // Back to back, with no limit per visit (VIDEO_MAX_CLIPS_PER_EPISODE is
 // removed). A clip ends at the first of:
 //   - D1 low for VIDEO_END_QUIET_S, the quiet window: presence has ended. The
-//     radar's own unmanned delay is already inside OT2, so a clip runs on for
-//     that delay plus VIDEO_END_QUIET_S after the person leaves
+//     radar's own unmanned delay (RADAR_UNMANNED_DELAY_S) is already inside
+//     OT2, so a clip runs on for that delay plus VIDEO_END_QUIET_S after the
+//     person leaves, 14 s at the defaults
 //   - VIDEO_MAX_CLIP_S
 //   - the buffer filling
 // A clip that ended on one of the last two is sent and, if D1 is still high,
@@ -741,7 +755,7 @@
 // as the lead-in to a clip:
 //
 //       30 s  PIR_IDLE_MAX_S       D1 waited out before the idle sleep
-//                                  (main.cpp)
+//                                  (main.cpp): RADAR_UNMANNED_DELAY_S + 20
 //   +   29 s  8 + 21 s             a failed hostname refresh, once a wake
 //                                  (HOSTNAME_REFRESH_INTERVAL_S): a lease at
 //                                  WIFI_DHCP_TIMEOUT_MS that cannot resolve

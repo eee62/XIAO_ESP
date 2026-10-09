@@ -84,8 +84,12 @@
 #define CAM_PIN_HREF  47
 #define CAM_PIN_PCLK  13
 
-// Give up waiting for the presence line to drop rather than spin forever.
-#define PIR_IDLE_MAX_S 30
+// Give up waiting for the presence line to drop rather than spin forever. The
+// radar holds OT2 for RADAR_UNMANNED_DELAY_S after the last presence, so the
+// wait outlasts that by 20 s: 30 s at the radar's 10 s minimum, as it was
+// against the AM312's ~10 s pulse. A radar retuned to a longer delay lengthens
+// it to match, and the wake deadline's static_assert below checks the sum.
+#define PIR_IDLE_MAX_S (RADAR_UNMANNED_DELAY_S + 20)
 
 // "Never" for rtc_last_report_attempt_s. Not 0: now_s() legitimately returns
 // 0 during the first second after a cold boot.
@@ -1427,10 +1431,10 @@ static void maybe_send_telemetry_only()
 // ---------------------------------------------------------------------------
 // Sleep
 // ---------------------------------------------------------------------------
-// The sensor holds its output high after the last presence: the AM312 for ~10 s
-// (1), the radar for its unmanned delay. Arming an active-high level wake while
-// it is still asserted would re-wake us immediately, so wait it out in light
-// sleep first.
+// The radar holds OT2 high for RADAR_UNMANNED_DELAY_S after the last presence
+// (config.h), where 1 has the AM312 holding for ~10 s. Arming an active-high
+// level wake while it is still asserted would re-wake us immediately, so wait it
+// out in light sleep first, for at most PIR_IDLE_MAX_S.
 static void wait_for_pir_idle()
 {
 	uint32_t guard = 0;
@@ -2235,6 +2239,8 @@ static_assert(PHOTOS_PER_EPISODE == 1,
               "the entry photo's verdict gates the episode; a second photo has "
               "no place in the flow (config.h)");
 static_assert(VIDEO_MAX_CLIPS_PER_DAY >= 1, "VIDEO_MAX_CLIPS_PER_DAY is the fuse (config.h)");
+static_assert(RADAR_UNMANNED_DELAY_S >= 10,
+              "the LD2410S's unmanned delay is 10 s at the least (config.h)");
 // Two deadlines, not one (config.h, Wake deadline). A visit has no clip limit of
 // its own, so no single deadline could be both short and long enough for the
 // 30 clips the fuse allows; each stretch gets its own instead.
