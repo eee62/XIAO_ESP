@@ -18,13 +18,15 @@ static void check(bool ok, const char *what)
 	}
 }
 
-// The episode every case is judged against: photo message 500 in chat
-// -100123, sent at 1700000000, tagged K7QF, nothing processed before 900.
+// The episode every case is judged against: photo message 500 and first clip
+// message 503 in chat -100123, photo sent at 1700000000, tagged K7QF, nothing
+// processed before 900.
 static tg_episode_ref_t ep()
 {
 	tg_episode_ref_t e;
 	e.chat_id      = -100123;
 	e.photo_msg_id = 500;
+	e.clip_msg_id  = 503;
 	e.photo_date   = 1700000000;
 	e.tag          = "K7QF";
 	e.floor_update = 900;
@@ -81,6 +83,16 @@ int main()
 	      "stop, as a reply to the photo");
 	check(scan(body(upd(901, "message", C, D, "No", 500))).reply == TG_REPLY_STOP,
 	      "No, same second as the photo");
+	check(scan(body(upd(901, "message", C, D + 40, "keep", 503))).reply == TG_REPLY_KEEP,
+	      "keep, as a reply to the first clip");
+	{
+		tg_episode_ref_t e = ep();
+		e.photo_msg_id = -1;   // the photo's response could not be read
+		check(scan(body(upd(901, "message", C, D + 40, "keep", 503)), e).reply == TG_REPLY_KEEP,
+		      "photo id unknown: a reply to the clip still counts");
+		check(scan(body(upd(901, "message", C, D + 40, "keep", -1)), e).reply == TG_REPLY_NONE,
+		      "photo id unknown: a reply_to of -1 does not match it");
+	}
 	check(scan(body(upd(901, "message", C, D + 5, "keep #k7qf", 0))).reply == TG_REPLY_KEEP,
 	      "keep #k7qf, not a reply but tagged");
 	check(scan(body(upd(901, "message", C, D + 5, "/keep@wildbot K7QF", 0))).reply == TG_REPLY_KEEP,
@@ -101,6 +113,8 @@ int main()
 	      "dated before the photo");
 	check(scan(body(upd(901, "message", C, D + 5, "keep", 499))).reply == TG_REPLY_NONE,
 	      "a reply to an older message");
+	check(scan(body(upd(901, "message", C, D + 5, "keep", 504))).reply == TG_REPLY_NONE,
+	      "a reply to a later clip (not the first)");
 	check(scan(body(upd(901, "message", C, D + 5, "keep", 0))).reply == TG_REPLY_NONE,
 	      "keep with no reference to the episode");
 	check(scan(body(upd(901, "message", C, D + 5, "keep #K7QX", 0))).reply == TG_REPLY_NONE,

@@ -390,9 +390,11 @@ static tg_reply_t judge_update(js_t u, const tg_episode_ref_t *ep)
 	if (word == TG_REPLY_NONE) {
 		return TG_REPLY_NONE;
 	}
-	const bool replies_to_photo = js_path(m, "reply_to_message.message_id", &v) &&
-	                              js_int(v, &x) && x == ep->photo_msg_id;
-	if (!replies_to_photo && !has_tag(text, ep->tag)) {
+	// Message ids are positive, so an unknown one (-1) never matches.
+	const bool replies_to_ours = js_path(m, "reply_to_message.message_id", &v) &&
+	                             js_int(v, &x) && x > 0 &&
+	                             (x == ep->photo_msg_id || x == ep->clip_msg_id);
+	if (!replies_to_ours && !has_tag(text, ep->tag)) {
 		return TG_REPLY_NONE;
 	}
 	return word;

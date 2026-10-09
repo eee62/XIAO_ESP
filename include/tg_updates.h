@@ -45,8 +45,10 @@ enum tg_reply_t : uint8_t {
 // The episode a reply has to be about.
 struct tg_episode_ref_t {
 	int64_t     chat_id;        // TELEGRAM_CHAT_ID as a number
-	int64_t     photo_msg_id;   // message_id of this episode's entry photo
-	int64_t     photo_date;     // its date, Unix seconds by Telegram's clock
+	int64_t     photo_msg_id;   // message_id of this episode's entry photo, or -1
+	int64_t     clip_msg_id;    // message_id of its first clip, or -1
+	int64_t     photo_date;     // the photo's date (the clip's if the photo's
+	                            // is unknown), Unix seconds by Telegram's clock
 	const char *tag;            // the episode's short id, as in the captions
 	int64_t     floor_update;   // only update_ids above this count; -1: any
 };
@@ -67,8 +69,8 @@ struct tg_scan_t {
 //     in ep->chat_id
 //   - its date is no earlier than the photo's: it was written after the
 //     photo existed, by Telegram's own clock on both sides
-//   - it refers to this episode: a reply to the photo's own message, or text
-//     that carries ep->tag as a word
+//   - it refers to this episode: a reply to the photo's or the first clip's
+//     own message, or text that carries ep->tag as a word
 //   - its first word is keep, yes, stop or no (any case, a leading '/' and a
 //     trailing "@botname" allowed, so the bot commands /keep and /stop work)
 // The newest update that counts wins. Every update_id read, counting or not,
