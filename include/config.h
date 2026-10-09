@@ -23,7 +23,14 @@
 // Pins — PROJECT_BRIEF.md 8. VERIFIED against the schematic. Do not reassign
 // the camera pins.
 // ---------------------------------------------------------------------------
-#define PIN_PIR        GPIO_NUM_2  // D1, RTC-capable, ext0 wake, AM312 active-high
+// PIN_PIR is the firmware's one presence input, and "D1" below means this pin.
+// The brief (1, 8) puts an AM312 PIR on it. This node's sensor is an LD2410S
+// radar whose OT2 digital output drives it instead, active-high like the
+// AM312 was; the brief predates the radar and is not edited (12 already
+// anticipates a sensor swap on the same GPIO). The PIR_* and "PIR" names in
+// the code are that history: they mean this input. Comments that argue from
+// the AM312's electrical behaviour (PIR_INTERNAL_PULLDOWN) were written for it.
+#define PIN_PIR        GPIO_NUM_2  // D1, RTC-capable, ext0 wake, active-high
 #define PIN_CAM_POWER  GPIO_NUM_1  // D0, drives the 2N3904 base
 
 // Whether D1 gets the ESP32-S3's internal pulldown. Leave it at 0.
@@ -175,55 +182,90 @@
 #define CAM_AEC2             0
 
 // ---------------------------------------------------------------------------
-// Trigger flow — replaces PROJECT_BRIEF.md 9.2
+// Trigger flow — replaces PROJECT_BRIEF.md 9.2, and departs from 1, 8 and 9.1
 //
-// 9.2's isolated/burst rule existed to decide when detection was worth its
-// energy. Detection now runs on every photo, with the radio off, and decides
-// what goes out, so the isolated/burst split, its trigger window and the
-// light-sleep burst buffer are gone. This is a deliberate departure from the
-// brief, which is left as it is.
+// The brief is left as it is. Where the firmware departs from it:
+//   9.2   The isolated/burst rule existed to decide when detection was worth
+//         its energy. Detection now runs on the first photo of every episode,
+//         radio off, and that one verdict gates the whole episode. The
+//         isolated/burst split, its trigger window and the light-sleep burst
+//         buffer are gone.
+//   1, 8  The presence sensor is an LD2410S radar, its OT2 output on PIN_PIR,
+//         not the AM312 PIR. A radar holds OT2 high for its own unmanned delay
+//         after the last presence, as the PIR held its output after the last
+//         motion, so "D1 high" still means present-or-just-was.
+//   9.1   "Return to deep sleep" after one photo no longer holds for a visit
+//         the AI confirms: the node stays awake and records until the radar
+//         says the visit is over. The order inside the wake does hold: camera
+//         first, radio after (step 5, 10), for the video as for the photo.
+//   9.6   Still holds. Nothing is spooled: a photo or a clip that cannot be
+//         sent on the wake that took it is dropped, and counted.
 //
-// Every PIR trigger captures a still, detection judges it, and the radio
-// comes up only for a photo that is going out. Between PIR events the node is
-// in deep sleep, inside a presence episode as much as outside one.
+// Each presence episode, at the OT2 rising edge that opens it:
+//   1. Capture ONE photo at once, camera before radio (9.1).
+//   2. Person detection on it, radio off:
+//        no person  Send nothing, record nothing; count it suppressed and go
+//                   back to sleep. This one verdict gates the whole episode, so
+//                   wind, a pet or the radar's back lobe cost a capture and a
+//                   detection and produce no traffic.
+//        can't run  Fail open: treated as a person (photo sent, recording
+//                   starts), counted as a detect error.
+//        person     Send the photo, the instant alert; then record.
+//   3. Record for as long as the radar shows presence (Presence video, below).
+// There is no second look: no fresh check, no further photos
+// (PHOTOS_PER_EPISODE), no person gate on the video. The entry photo's result
+// stands for the episode. The old rule that held a clip back until
+// VIDEO_PRESENCE_MIN_S (10 s) of motion was a PIR-era false-trigger proxy, made
+// redundant by radar presence plus this AI confirmation, and is removed with
+// its timing code.
 //
-// Energy per trigger, from the ~250 mA active figure in 7 (bench to confirm):
-//   ~0.2 s boot, ~0.6 s cold init, CAM_WARMUP_MS, a frame   ~0.12 mAh
-//   detection: model load, a reduced decode, inference      ~0.04 mAh
-//   total for a photo that is judged and dropped            ~0.16-0.2 mAh
-//   sending it: association, TLS, and the upload            +~0.4-0.55 mAh
-//     for a QSXGA still at ~200 kB/s (see CAM_FRAMESIZE); ~4.5 mAh at the
-//     TELEGRAM_MIN_BPS floor
-// Against 7's ~9 mAh/day (8.2 of it sleep), ten person photos a day are
-// ~6-7 mAh.
+// What that costs: a person the radar sees before the camera does (outside the
+// lens, or beyond the detector's range) is judged on an empty frame, and the
+// episode stays gated off for as long as OT2 stays high, since nothing looks
+// again. The next chance is the next episode.
+//
+// bench-nodetect (DETECTION_ENABLED 0) has no detector, so the AI gate cannot
+// run there. It records on presence alone, no gate: the entry photo goes out
+// unfiltered and every episode counts as confirmed, because that is the only
+// way the build does anything. It is the build for 11 step 5, a power
+// measurement, not a deployment. SEND_ONLY_PERSONS 0 does the same in a detect
+// build.
+//
+// Between sensor edges the node is in deep sleep, inside an episode as much as
+// outside one. Costs per photo, clip and episode are in the energy note under
+// Presence video.
 // ---------------------------------------------------------------------------
 
-// 1: only photos the detector scores at DETECT_SCORE_THRESHOLD or above go
-// out, plus any it could not judge (fail open). 0: every photo goes out,
-// which is the only way animals get through: the models find people only.
-// bench-nodetect has no detector and always sends unfiltered.
+// 1: the entry photo's detection is the gate (above). A photo scored at
+// DETECT_SCORE_THRESHOLD or above, or one the detector could not judge (fail
+// open), goes out and the episode records; any other sends nothing and records
+// nothing. 0: no gate. Every episode counts as confirmed and its photo and
+// video go out for anything that holds the radar, which is the only way animals
+// get through, since the models find people only. (That now covers the video
+// too: the separate VIDEO_REQUIRE_PERSON gate is gone.) bench-nodetect has no
+// detector and always runs ungated.
 #define SEND_ONLY_PERSONS      1
 
-// Sent photos per presence episode, at most. A lingering person keeps
-// retriggering the PIR; the clip covers that. Once an episode has this many,
-// its further triggers are counted ("capped") but not photographed, which
-// saves a capture and a detection each.
-#define PHOTOS_PER_EPISODE     3
+// Photos per presence episode: the entry photo and no more; the video covers
+// the rest of the visit. A rising edge inside an episode that has its photo is
+// counted ("capped") and nothing is captured, which saves a capture and a
+// detection each. It stays a macro so the figures in the energy note read from
+// it, but the flow takes the entry photo's verdict as the whole episode's gate
+// and cannot take a second one, so main.cpp asserts it is 1.
+#define PHOTOS_PER_EPISODE     1
 
-// Presence episodes. One opens on a PIR rising edge when none is open, stays
+// Presence episodes. One opens on an OT2 rising edge when none is open, stays
 // open while D1 is high or has been low for less than PRESENCE_GAP_S, and
-// closes once D1 has been low that long. Kept in RTC memory.
+// closes once D1 has been low that long. Kept in RTC memory. Inside one it is a
+// single visit: the gate was settled at its edge, so a person who steps out and
+// back within the gap gets no second photo and does not lose the recording.
 #define PRESENCE_GAP_S         8
 
-// AM312 hold time: how long D1 stays high after the last motion, in seconds
-// (fractions allowed). 2.5 s is an estimate for a typical AM312, whose hold
-// is fixed by the module at around 2-3 s and cannot be adjusted, unlike the
-// potentiometer PIR boards that the brief's ~10 s figure fits. It is NOT a
-// measurement of this unit. To measure it: deployment mode's PIR card shows
-// how long D1 was last high; wave once, briefly, and that is the hold time
-// plus the wave. Set it here; nothing else needs to change. It decides how
-// late a presence clip can start (VIDEO_PRESENCE_MIN_S + PIR_HOLD_S).
-#define PIR_HOLD_S             2.5
+// There is no PIR_HOLD_S. Its one reader was the 10-second rule's motion proof,
+// which is gone. The sensor's own hold after the last presence (the radar's
+// unmanned delay, a setting on the LD2410S) is inside OT2 and lengthens every
+// clip's tail by that long on top of VIDEO_END_QUIET_S. Deployment mode's walk
+// test still shows how long D1 stayed high after one brief wave.
 
 // Wind backoff. A branch in wind retriggers the PIR all day and never holds
 // a person. After WIND_STREAK_BACKOFF photos in a row judged "no person", the
@@ -280,47 +322,47 @@
 // ---------------------------------------------------------------------------
 // Presence video
 //
-// A clip is recorded when the PIR shows presence for VIDEO_PRESENCE_MIN_S or
-// longer and, with VIDEO_REQUIRE_PERSON, the detector has confirmed a person
-// during the episode. The camera and the radio are never on together (9.1
-// step 5, 10): record with the radio off, camera off, then send.
+// When the entry photo confirms a person (Trigger flow, above) the node records
+// for as long as the radar shows presence, and sends what it recorded. Nothing
+// holds the first clip back. The old rule that waited for VIDEO_PRESENCE_MIN_S
+// (10 s) of motion, the motion-proof timing built on PIR_HOLD_S, and the
+// VIDEO_REQUIRE_PERSON gate with its one fresh still are all removed. The 10 s
+// rule was a PIR-era false-trigger proxy: a PIR cannot tell a person from a
+// branch, so "it kept moving for 10 s" stood in for "worth filming". Radar
+// presence plus the AI confirmation at the edge do that job, which makes the
+// proxy redundant. The camera and the radio are never on together (9.1 step 5,
+// 10): record with the radio off and the camera off, then send.
 //
-// The 10-second rule is about motion, not the episode's age. The AM312 holds
-// D1 high for PIR_HOLD_S after the last motion, so a 1 s walk-by alone keeps
-// it high for PIR_HOLD_S; an age check would film everyone who passes. Motion
-// is proven at episode time T >= VIDEO_PRESENCE_MIN_S by a rising edge at T,
-// or by D1 still high at T + PIR_HOLD_S. With continuous motion there are no
-// new edges, so the earliest clip starts about VIDEO_PRESENCE_MIN_S +
-// PIR_HOLD_S after arrival, plus a boot and camera init: at 2.5 s, motion is
-// proven at 12.5 s and the first frame is ~13.6 s in (~0.25 s boot, ~0.55 s
-// power-up and cold init, VIDEO_WARMUP_MS). A 15 s visit therefore gets a
-// clip, catching its last ~1.4 s and then the VIDEO_END_QUIET_S tail after D1
-// falls at 17.5 s: ~7.9 s of clip in all, ~12.9 s for a 20 s visit. A visitor
-// who leaves before ~13.6 s is in the photos only. (With the brief's 10 s
-// hold it would be ~21 s, after a 15 s visitor left.)
+// Back to back, with no limit per visit (VIDEO_MAX_CLIPS_PER_EPISODE is
+// removed). A clip ends at the first of:
+//   - D1 low for VIDEO_END_QUIET_S, the quiet window: presence has ended. The
+//     radar's own unmanned delay is already inside OT2, so a clip runs on for
+//     that delay plus VIDEO_END_QUIET_S after the person leaves
+//   - VIDEO_MAX_CLIP_S
+//   - the buffer filling
+// A clip that ended on one of the last two is sent and, if D1 is still high,
+// the next starts straight away; so on for as long as the visit lasts.
+// Recording stops only when presence ends, when a send fails (the photo's or a
+// clip's: the uplink is down and the next clip would be dropped too), or at the
+// daily fuse below.
 //
-// The person gate (VIDEO_REQUIRE_PERSON) keeps a branch in steady wind, which
-// can hold D1 high for minutes, from being filmed. If a photo earlier in the
-// episode held a person, the clip starts at once. If not, one fresh still is
-// taken and judged, at most once per episode; no person means no clip this
-// episode. A person there starts the clip straight away: the still is held
-// in PSRAM through the recording and sent after it, before the clip's own
-// upload, so the visitor is filmed instead of waiting out an association and
-// an upload first. It counts toward PHOTOS_PER_EPISODE as any photo does. A
-// trigger photo taken at the very moment motion is proven serves as that
-// fresh check. bench-nodetect has no detector and records on the 10-second
-// rule alone.
+// At each clip boundary D1 is sampled once. Low means the visit ended while the
+// photo or the previous clip was being sent: no further clip. VIDEO_END_QUIET_S
+// is shorter than PRESENCE_GAP_S, so the episode stays open until
+// PRESENCE_GAP_S after D1 fell, and a rising edge inside that is the same
+// visit: it resumes recording, with no second photo. Past the gap an edge is a
+// new episode, with its own photo and its own gate.
 //
-// Recording stops at the first of: D1 low for VIDEO_END_QUIET_S, the clip
-// reaching VIDEO_MAX_CLIP_S, or the buffer filling. VIDEO_END_QUIET_S is
-// shorter than PRESENCE_GAP_S, so a clip that ends on quiet leaves the
-// episode open: it closes PRESENCE_GAP_S after D1 fell, and a visitor who
-// moves again before then is the same visit, whose new edge can start another
-// clip. If it stopped on a cap and D1 is still high once the clip is sent,
-// another is recorded. Either way, at most VIDEO_MAX_CLIPS_PER_EPISODE. A
-// clip that fails to send ends clips for the episode, since the next would be
-// dropped too. PIR edges during recording are the same visitor: they keep the
-// clip going but are not triggers, and no still is taken for them.
+// Two limits on "the full visit". The clips are not gapless: a clip fills most
+// of PSRAM, so it must be sent before the next is recorded, and camera and
+// radio never overlap, so the visit goes unrecorded during every upload. That
+// is about half of it at ~200 kB/s (30 s recorded, ~29 s uploading) and about a
+// quarter at the TELEGRAM_CLIP_MIN_BPS floor. And the first clip starts after
+// the entry photo is sent, because that photo is the instant alert. Boot,
+// capture, detection, an association and an upload come first: roughly 8-13 s
+// from the edge to the first frame (an estimate from the figures in this file:
+// ~2 s to a photo in PSRAM, ~1 s of detection, ~4-9 s to send it, ~1 s of
+// camera bring-up; the log has the real times).
 //
 // The file is MJPEG in AVI (src/avi.cpp), built in one PSRAM buffer of
 // min(VIDEO_MAX_BYTES, free PSRAM - VIDEO_PSRAM_RESERVE, largest free block),
@@ -330,48 +372,68 @@
 // Buffer against time: VGA JPEGs at VIDEO_JPEG_QUALITY 12 should run
 // ~30-60 kB (SVGA at 14 was estimated at ~35-75 kB; VGA has 0.64 of the
 // pixels, and 12 is a little bigger than 14), 240-480 kB/s at 8 fps, so 5 MB
-// lasts ~11-22 s: the whole ~8-13 s clip of a 15-20 s visit even at the top
-// of that range, with the quiet tail. A frame over the driver's buffer
-// (w x h / 5, 61,440 bytes at VGA) is dropped by it, so record_clip()
-// coarsens the quality once, as capture() does for stills. These sizes are
-// estimates; deployment mode's test clip reports real ones.
+// lasts ~11-22 s. A frame over the driver's buffer (w x h / 5, 61,440 bytes at
+// VGA) is dropped by it, so record_clip() coarsens the quality once, as
+// capture() does for stills. These sizes are estimates; deployment mode's test
+// clip reports real ones.
 //
-// PSRAM, 8 MB. The worst case is the fresh check's still held through the
-// recording at its 983,040-byte maximum (CAM_FRAMESIZE). Allowing 128 kB for
-// everything else in PSRAM, and 256 kB for the WiFi driver and lwIP while
-// sending (CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP; mbedTLS allocates
-// internally), free PSRAM at each peak is:
-//   recording: clip buffer, still, two 61,440-byte VGA frame buffers
-//     8,388,608 - 131,072 - 983,040 - 122,880 - 5,242,880 = 1,908,736 (1.82 MB)
-//   sending the still: clip buffer, still, WiFi; frame buffers freed
-//     8,388,608 - 131,072 - 983,040 - 262,144 - 5,242,880 = 1,769,472 (1.69 MB)
-//   sending the clip: the still freed by then          2,752,512 (2.62 MB)
-// Keeping 1.5 MB free at both peaks allows a buffer of at most ~5.19 MB, so
-// 5 MB; 6 MB would leave ~0.69 MB while the still is sent. With no still held
-// (a person seen earlier in the visit) both peaks have ~2.6-2.8 MB free.
-// VIDEO_PSRAM_RESERVE holds the same margin at run time whatever the
-// allowances turn out to be: when less is free than budgeted, the buffer
+// PSRAM, 8 MB. No photo is held while a clip is recorded or sent: the entry
+// photo is judged, sent and freed before the first clip's buffer is allocated,
+// so the still stage (the driver's two 983,040-byte buffers, the copy and
+// detection, ~3 MB) never coexists with a clip buffer. The record+send peak is
+// therefore the clip buffer plus the camera's or the radio's own share.
+// Allowing 128 kB for everything else in PSRAM, and 256 kB for the WiFi driver
+// and lwIP while sending (CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP; mbedTLS
+// allocates internally):
+//   recording: clip buffer, two 61,440-byte VGA frame buffers
+//     in use 5,242,880 + 122,880 + 131,072 = 5,496,832 (5.24 MB)
+//     free   8,388,608 - 5,496,832         = 2,891,776 (2.76 MB)
+//   sending the clip: clip buffer, WiFi; frame buffers freed
+//     in use 5,242,880 + 262,144 + 131,072 = 5,636,096 (5.38 MB)
+//     free   8,388,608 - 5,636,096         = 2,752,512 (2.62 MB)
+// Sending is the peak, and a long visit repeats it for every clip. Budgeted,
+// not measured. The still held through recording that used to cap the buffer at
+// ~5.19 MB is gone, so VIDEO_MAX_BYTES could grow; it is left at 5 MB.
+// VIDEO_PSRAM_RESERVE holds the margin at run time whatever the allowances turn
+// out to be: when less is free than budgeted, or fragmented, the buffer
 // shrinks, not the margin.
 //
-// Energy per clip, from the ~250 mA active figure in 7 (bench to confirm;
-// recording has the radio off, so 250 mA likely overstates that part):
-//   camera init and warm-up, ~1 s                          ~0.07 mAh
-//   recording, up to VIDEO_MAX_CLIP_S                      ~2.1 mAh at 30 s
-//   association, TLS, a 5 MB upload at ~200 kB/s (~29 s)   ~2.0 mAh
-//   total                                                  ~4.2 mAh
-// At the TELEGRAM_CLIP_MIN_BPS floor the upload alone is ~5.9 mAh (~85 s),
-// ~8.1 mAh a clip. The daily cap is what bounds this. VIDEO_MAX_CLIPS_PER_DAY
-// 3 is ~12.6 mAh on a day that reaches it (~24 mAh if every upload crawled at
-// the floor). That does NOT fit 7's ~9 mAh/day: 8.2 mAh of that is sleep,
-// which leaves ~0.8 mAh/day for everything else, less than one clip. No cap
-// of one or more fits. A node that hit this cap every day would draw
-// ~22 mAh/day (~33 at the floor) and last ~5 months (~3.4 at the floor)
-// instead of ~a year; clips on only a few days a week keep the average near
-// budget.
+// Energy, from the ~250 mA active figure in 7 (bench to confirm; recording has
+// the radio off, so 250 mA likely overstates that part). None of it includes
+// the radar's own standing draw: 7's ~340 uA sleep total is the AM312 build
+// (15 uA), and the LD2410S is not in the brief.
+//   entry photo, judged and sent: boot, cold init, warm-up and a frame ~0.12,
+//     detection ~0.04, association + TLS + a QSXGA upload ~0.4-0.55  ~0.6-0.7 mAh
+//   entry photo, judged and dropped (no person)                      ~0.16-0.2 mAh
+//   one clip: camera init + warm-up ~0.07, recording at 250 mA, then
+//     association + TLS + upload:
+//       filling its 30 s cap (~5 MB, ~29 s up at ~200 kB/s) 0.07 + 2.1 + 2.0 = ~4.2 mAh
+//       the same at the TELEGRAM_CLIP_MIN_BPS floor (~85 s) 0.07 + 2.1 + 5.9 = ~8.1 mAh
+//       ~10 s (2.4-4.8 MB, 15-27 s up with the handshake) 0.07 + 0.7 + 1.0-1.9 = ~1.8-2.6 mAh
+// Per episode:
+//   no person                                                 ~0.2 mAh
+//   short visit, 1 photo + 1 clip of ~10 s            ~0.6-0.7 + 1.8-2.6 = ~2.4-3.3 mAh
+//   the same with the clip filling its 30 s cap               ~0.7 + 4.2 = ~4.9 mAh
+//   long visit that reaches the fuse, 1 photo + 30 clips   ~0.7 + 30 x 4.2 = ~127 mAh
+//     (~244 mAh if every upload crawls at the floor)
+// The node is awake at ~250 mA for the whole of a visit, so the rule of thumb
+// is ~4.2 mAh per minute of presence, however it splits between recording and
+// uploading. The fuse bounds clips, not minutes: 30 clips span ~30 min awake at
+// ~200 kB/s and ~58 min at the floor.
+//
+// Against 7's ~9 mAh/day, 8.2 of it sleep, which leaves ~0.8 mAh/day for
+// everything else: one short visit costs 3-4 times that allowance, so a day with
+// a visit overspends it. A fuse day is ~127 + 8.2 = ~135 mAh (~252 at the
+// floor): 15 days (28) of 7's budget in one, ~4% (~7%) of the cell. A node that
+// hit the fuse every day would last ~25 days (~13), not a year. The old limits
+// (3 clips a visit, 3 a day) held that worst case near 22 mAh/day (~33 at the
+// floor).
+//
+// Recording the whole visit is expensive BY DESIGN. A long genuine visit costs
+// what it costs, ~4 mAh a minute; the fuse is there to stop a stuck-on radar,
+// not to ration visitors.
 // ---------------------------------------------------------------------------
 #define VIDEO_ENABLED                1
-#define VIDEO_PRESENCE_MIN_S         10
-#define VIDEO_REQUIRE_PERSON         1
 // Never above HD, the usual limit for M-JPEG playback on phones; main.cpp
 // checks it.
 #define VIDEO_FRAMESIZE              FRAMESIZE_VGA
@@ -380,6 +442,7 @@
 // Short: a clip wants to start, and a clip's first frames going slightly off
 // in colour cost less than the moment they would miss.
 #define VIDEO_WARMUP_MS              300
+// The quiet window: D1 low this long ends a clip, and with it the recording.
 #define VIDEO_END_QUIET_S            4
 #define VIDEO_MAX_CLIP_S             30
 #define VIDEO_MAX_BYTES              (5 * 1024 * 1024)
@@ -389,16 +452,15 @@
 // Counted against all free PSRAM, not the largest block: the margin is free
 // memory wherever it lies. See the PSRAM budget above.
 #define VIDEO_PSRAM_RESERVE          ((1536 + 256) * 1024)
-#define VIDEO_MAX_CLIPS_PER_EPISODE  3
-// In any rolling 24 hours, by now_s(); a clip counts, by its start time, once
-// it has actually been recorded. See the energy note above.
-#define VIDEO_MAX_CLIPS_PER_DAY      3
-
-// bench-nodetect has no detector to confirm a person with.
-#if !DETECTION_ENABLED
-#undef  VIDEO_REQUIRE_PERSON
-#define VIDEO_REQUIRE_PERSON         0
-#endif
+// THE DAILY FUSE. This is a fuse, not a normal limit: it exists only to stop a
+// stuck-on radar or a pathological day from flattening the cell, and at 30 it
+// never fires in normal use. In any rolling 24 hours, by now_s(), a clip counts
+// by its start time once it has actually been recorded. When the count reaches
+// this, recording is refused (for that episode and the ones after it, until the
+// oldest clip is 24 h old); the entry photo still goes out. Every refusal is
+// counted and reported ("clip fuse ... TRIPPED" in the caption and on the
+// status page). A fuse day costs ~135 mAh: see the energy note above.
+#define VIDEO_MAX_CLIPS_PER_DAY      30
 
 // ---------------------------------------------------------------------------
 // WiFi — PROJECT_BRIEF.md 9.4: static IP and a cached BSSID/channel, so the
@@ -627,30 +689,31 @@
 // a wake that hangs in a TLS read that never returns or a library deadlock:
 // the node would stay up, radio and all, until the DW01 cut the cell off (6).
 //
-// setup() arms a one-shot esp_timer for this long once it knows the wake is
-// not deployment mode, and on expiry the node calls esp_system_abort(). Every
-// build prints and reboots on a panic, so the next boot sees ESP_RST_PANIC
-// and takes the abnormal-reset path: counted as a crash in the report (9.3),
-// then back to sleep without the radio. Deployment mode is attended and never
-// sleeps, so it is never on the clock.
+// setup() arms a one-shot esp_timer once it knows the wake is not deployment
+// mode, and on expiry the node calls esp_system_abort(). Every build prints
+// and reboots on a panic, so the next boot sees ESP_RST_PANIC and takes the
+// abnormal-reset path: counted as a crash in the report (9.3), then back to
+// sleep without the radio. Deployment mode is attended and never sleeps, so it
+// is never on the clock.
 //
-// This has to sit above the longest wake that is slow but not hung. That is
-// a presence-video wake: a trigger photo, the video gate's fresh still (sent
-// after the first clip is recorded), then VIDEO_MAX_CLIPS_PER_EPISODE clips,
-// each recorded and sent before the next. Every term is a timeout or a cap
-// in the code:
+// Two deadlines, not one. A visit has no clip limit of its own (Presence
+// video), so a single deadline would have to cover the 30 clips the fuse allows:
+// 140 minutes, in which a hang with the radio up burns ~220 mAh before anything
+// notices. Instead the same timer is re-armed per stretch of the wake, and each
+// stretch only has to cover itself:
 //
-//       30 s  PIR_IDLE_MAX_S       D1 waited out before the idle sleep
-//                                  (main.cpp)
-//   +   29 s  8 + 21 s             a failed hostname refresh, once a wake
-//                                  (HOSTNAME_REFRESH_INTERVAL_S): a lease at
-//                                  WIFI_DHCP_TIMEOUT_MS that cannot resolve
-//   +  414 s  2 x (54 + 153 s)     two stills: an association and a
-//                                  tg_post() each
-//   +  771 s  3 x (30 + 54 + 173)  the clips: VIDEO_MAX_CLIP_S of recording,
-//                                  an association and a tg_post() of
-//                                  VIDEO_MAX_BYTES each
-//   = 1244 s
+//   WAKE_DEADLINE_S       the entry stretch: from setup() to the first clip, or
+//                         to the end of a wake that records none
+//   WAKE_CLIP_DEADLINE_S  one clip cycle, record then send, re-armed fresh at
+//                         the start of each, so a stuck step trips within one
+//                         cycle and a visit of any length can still run
+//                         across as many clips as the fuse allows
+//
+// Both are checked against their derivations at compile time (main.cpp), so
+// retuning a term past its deadline fails the build instead of cutting slow
+// wakes short.
+//
+// Every term below is a timeout or a cap in the code.
 //
 // An association is at most 54 s: WIFI_CONNECT_TIMEOUT_MS +
 // WIFI_DHCP_TIMEOUT_MS, and a DNS lookup in wifi_reachable() on the static
@@ -674,17 +737,51 @@
 // For a clip, B is VIDEO_MAX_BYTES plus the same, 82 s at the clip floor for
 // 5 MB: 46 + 30 + 82 + 15 = 173 s.
 //
-// 32 minutes leaves 676 s for what no single timeout bounds: two captures,
-// ~10 s each at worst (init, CAM_WARMUP_MS, and two 4 s fb_get() timeouts when
-// a frame overflows its buffer), two detections of seconds each, and three
-// video bring-ups of about a second, each with up to two 4 s fb_get()
-// timeouts of its own (record_clip()). main.cpp checks the sum at compile time,
-// so retuning a term past this fails the build instead of cutting slow wakes
-// short. It stays one deadline for the whole wake: under 45 minutes,
-// re-arming it per phase buys too little to be worth the complication. A hang
-// that runs the full 32 minutes with the radio up costs something like
-// 50 mAh, most of a week of the 7 budget, rather than the cell.
-#define WAKE_DEADLINE_S          (32 * 60)
+// The entry stretch must cover the longest wake that records nothing as well
+// as the lead-in to a clip:
+//
+//       30 s  PIR_IDLE_MAX_S       D1 waited out before the idle sleep
+//                                  (main.cpp)
+//   +   29 s  8 + 21 s             a failed hostname refresh, once a wake
+//                                  (HOSTNAME_REFRESH_INTERVAL_S): a lease at
+//                                  WIFI_DHCP_TIMEOUT_MS that cannot resolve
+//   +   20 s                       what no timeout bounds: a capture, ~10 s at
+//                                  worst (init, CAM_WARMUP_MS, two 4 s
+//                                  fb_get() timeouts when a frame overflows
+//                                  its buffer), and a detection, allowed 10 s
+//   +  207 s  54 + 153 s           the entry photo (PHOTOS_PER_EPISODE): an
+//                                  association and a tg_post()
+//   = 286 s   against 360 s, 74 s to spare
+//
+// A wake that sends no photo (no person) and owes a bare report is shorter:
+// 29 + 54 + 92 s for the association and a small tg_post(), plus the 30 s
+// idle wait, and the capture and detection.
+//
+// One clip cycle:
+//
+//       30 s  VIDEO_MAX_CLIP_S     recording
+//   +   13 s  1 + 2 x 4 + 4        camera bring-up, up to two 4 s fb_get()
+//                                  timeouts (record_clip()), and the time cap
+//                                  checked up to one timeout late
+//   +   29 s  8 + 21 s             the hostname refresh again: the first
+//                                  association of a wake is a clip's when a
+//                                  retrigger resumes a visit that already has
+//                                  its photo
+//   +   54 s                       an association
+//   +  173 s                       a tg_post() of VIDEO_MAX_BYTES
+//   = 299 s   against 360 s, 61 s to spare
+//
+// Nothing slow follows a clip cycle: a bare report is never due after one
+// (send_clip() stamps the attempt) and the episode is still open, so the sleep
+// is direct, with no idle wait. Between cycles the timer is simply re-armed.
+//
+// The cost of a hang is therefore one stretch, not the visit: 6 minutes at the
+// ~94 mA average that 50 mAh per 32 minutes implied is ~9 mAh, a day's
+// budget in 7, not 220. A trip mid-visit loses the episode (RTC memory does not
+// survive a panic reset), so the node sleeps without the radio and the next
+// edge starts a new visit.
+#define WAKE_DEADLINE_S          (6 * 60)
+#define WAKE_CLIP_DEADLINE_S     (6 * 60)
 
 // ---------------------------------------------------------------------------
 // Deployment mode — held-BOOT-button setup/aiming interface.

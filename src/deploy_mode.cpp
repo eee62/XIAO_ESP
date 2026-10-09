@@ -149,9 +149,10 @@ static uint32_t          g_clip_seq     = 0;
 static test_clip_t       g_clip         = {};
 static blob_ref          g_clip_avi;
 
-// PIR walk test. g_pir_high_ms is how long D1 was high the last time, rise to
-// fall, sampled every SERVICE_TICK_MS: after one brief wave that is the
-// AM312's hold time, the figure config.h's PIR_HOLD_S wants.
+// Presence walk test. g_pir_high_ms is how long D1 was high the last time, rise
+// to fall, sampled every SERVICE_TICK_MS: after one brief pass that is the
+// sensor's hold after the last presence (the radar's unmanned delay), which is
+// what lengthens a clip's tail beyond VIDEO_END_QUIET_S.
 static bool     g_pir_level       = false;
 static uint32_t g_pir_edges       = 0;
 static uint32_t g_pir_last_edge_s = 0;
@@ -376,10 +377,11 @@ static String status_json()
 	j += ",\"persons_only\":";  j += SEND_ONLY_PERSONS && DETECTION_ENABLED ? "true" : "false";
 	j += ",\"per_ep\":";        j += PHOTOS_PER_EPISODE;
 	j += ",\"gap\":";           j += PRESENCE_GAP_S;
-	j += ",\"hold\":";          j += String((float)PIR_HOLD_S, 1);
+	j += ",\"quiet\":";         j += VIDEO_END_QUIET_S;
 	j += ",\"clips_sent\":";    j += s.clips_sent_total;
 	j += ",\"clips_dropped\":"; j += s.clips_dropped_total;
 	j += ",\"clip_s\":";        j += s.clip_s_total;
+	j += ",\"fuse_trips\":";    j += s.clip_fuse_trips_total;
 	j += ",\"v_on\":";          j += VIDEO_ENABLED ? "true" : "false";
 	j += ",\"v_w\":";           j += resolution[VIDEO_FRAMESIZE].width;
 	j += ",\"v_h\":";           j += resolution[VIDEO_FRAMESIZE].height;
@@ -387,10 +389,7 @@ static String status_json()
 	j += ",\"v_fps\":";         j += VIDEO_FPS;
 	j += ",\"v_max_s\":";       j += VIDEO_MAX_CLIP_S;
 	j += ",\"v_max_kb\":";      j += (uint32_t)(VIDEO_MAX_BYTES / 1024);
-	j += ",\"v_per_ep\":";      j += VIDEO_MAX_CLIPS_PER_EPISODE;
-	j += ",\"v_per_day\":";     j += VIDEO_MAX_CLIPS_PER_DAY;
-	j += ",\"v_person\":";      j += VIDEO_REQUIRE_PERSON ? "true" : "false";
-	j += ",\"v_min_s\":";       j += VIDEO_PRESENCE_MIN_S;
+	j += ",\"v_fuse\":";        j += VIDEO_MAX_CLIPS_PER_DAY;
 	j += ",\"test_clip_s\":";   j += DEPLOY_TEST_CLIP_S;
 	j += ",\"sta_ssid\":\"";  j += json_escape(WIFI_SSID);
 	j += "\"";
@@ -709,7 +708,7 @@ function render(d){
     ' this session<br>'+(d.pir_edges?('last '+dur(d.uptime-d.pir_last)+' ago'):
     'walk-test the field of view')+
     (d.pir_high_ms?'<br>last high '+(d.pir_high_ms/1000).toFixed(1)+
-    ' s (one brief wave = hold time; PIR_HOLD_S '+d.hold+')':'');
+    ' s (one brief pass = the sensor hold time)':'');
 
   rows=[];
   row('Uptime',dur(d.uptime));
@@ -722,19 +721,21 @@ function render(d){
   row('Triggers',d.trig_total+' total · '+d.trig_since+' unreported');
   row('Photos sent',d.sent_total+' total · '+d.sent_since+' unreported · '+
     d.dropped+' dropped');
-  row('Suppressed',d.supp_total+' total · '+d.supp_since+' unreported · '+
-    d.capped+' over the visit cap');
+  row('Suppressed (no person)',d.supp_total+' total · '+d.supp_since+
+    ' unreported · '+d.capped+' edges inside a visit, not photographed');
   row('Detect errors',d.derr_total+' total · '+d.derr_since+' unreported');
   row('Last report',d.last_report?dur(d.uptime-d.last_report)+' ago':'never');
   clipSecs=d.test_clip_s;
   row('Clips',d.clips_sent+' sent · '+d.clips_dropped+' dropped · '+
     dur(d.clip_s)+' recorded');
   row('Video',!d.v_on?'off':d.v_w+'×'+d.v_h+' · q '+d.v_q+' · '+d.v_fps+' fps · ≤'+
-    d.v_max_s+' s or '+(d.v_max_kb/1024).toFixed(1)+' MB · after '+d.v_min_s+' s'+
-    (d.v_person?' + person':'')+' · '+d.v_per_ep+'/visit, '+d.v_per_day+'/day');
-  row('Photo rule',(d.persons_only?'persons only':'everything')+
-    ' · at most '+d.per_ep+' per visit');
-  row('PIR timing','hold '+d.hold+' s (PIR_HOLD_S) · visit gap '+d.gap+' s');
+    d.v_max_s+' s or '+(d.v_max_kb/1024).toFixed(1)+' MB a clip · whole visit, '+
+    'back to back');
+  row('Clip fuse',d.v_fuse+'/day · '+(d.fuse_trips?'TRIPPED '+d.fuse_trips+'×':
+    'never tripped'));
+  row('Gate',(d.persons_only?'entry photo must hold a person':'off, everything')+
+    ' · '+d.per_ep+' photo per visit');
+  row('Presence timing','quiet window '+d.quiet+' s · visit gap '+d.gap+' s');
   row('Wind',d.backoff_left?'PIR ignored for '+dur(d.backoff_left)+' more':
     (d.wind_streak?d.wind_streak+' empty photos in a row':'calm')+
     (d.backoff_total?' · ignored '+dur(d.backoff_total)+' so far':''));
