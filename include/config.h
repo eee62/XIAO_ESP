@@ -459,28 +459,56 @@
 //       filling its 30 s cap (~5 MB, ~29 s up at ~200 kB/s) 0.07 + 2.1 + 2.0 = ~4.2 mAh
 //       the same at the TELEGRAM_CLIP_MIN_BPS floor (~85 s) 0.07 + 2.1 + 5.9 = ~8.1 mAh
 //       ~10 s (2.4-4.8 MB, 15-27 s up with the handshake) 0.07 + 0.7 + 1.0-1.9 = ~1.8-2.6 mAh
-// Per episode:
-//   no person                                                 ~0.2 mAh
-//   short visit, 1 photo + 1 clip of ~10 s            ~0.6-0.7 + 1.8-2.6 = ~2.4-3.3 mAh
-//   the same with the clip filling its 30 s cap               ~0.7 + 4.2 = ~4.9 mAh
-//   long visit that reaches the fuse, 1 photo + 30 clips   ~0.7 + 30 x 4.2 = ~127 mAh
-//     (~244 mAh if every upload crawls at the floor)
-// The node is awake at ~250 mA for the whole of a visit, so the rule of thumb
-// is ~4.2 mAh per minute of presence, however it splits between recording and
-// uploading. The fuse bounds clips, not minutes: 30 clips span ~30 min awake at
-// ~200 kB/s and ~58 min at the floor.
+//   the reply window (Reply window, below), after the first clip, on that
+//   clip's association, so no association of its own:
+//     two getUpdates handshakes, ~2 s each at 250 mA                  ~0.3 mAh
+//     the rest of REPLY_WAIT_S waiting in modem sleep, ~21 s at an
+//       estimated ~40-60 mA (the CPU idling at 240 MHz, the radio
+//       waking for DTIM beacons)                                      ~0.2-0.35 mAh
+//     the whole window, no answer                                     ~0.5-0.6 mAh
+//     an answer already in at the first read (one handshake)          ~0.15 mAh
+//   At full power the same 25 s was ~1.7 mAh at 7's 250 mA (likely ~0.7-1.0
+//   at a listening radio's real draw). The modem-sleep figure is an estimate
+//   from datasheet-class numbers: bench to confirm.
 //
-// Against 7's ~9 mAh/day: sleep alone is now ~8.9 of it with the radar (was
-// 8.2), which leaves almost nothing for everything else, so any day with a
-// visit overspends it. A fuse day is ~127 + 8.9 = ~136 mAh (~253 at the
-// floor): 15 days (28) of 7's budget in one, ~4% (~7%) of the cell. A node that
-// hit the fuse every day would last ~25 days (~13), not a year. The old limits
-// (3 clips a visit, 3 a day) held that worst case near 22 mAh/day (~33 at the
-// floor).
+// Per episode, the three that matter:
+//   (a) no person: one capture and a detection, nothing sent         ~0.2 mAh
+//   (b) person, NO REPLY, the common case: photo, the one clip a visit without
+//       "keep" gets, then the whole window:
+//         ~10 s clip                         ~0.6-0.7 + 1.8-2.6 + 0.5-0.6 = ~2.9-3.9 mAh
+//         clip filling its 30 s cap                       ~0.7 + 4.2 + 0.6 = ~5.5 mAh
+//           (~9.4 at the TELEGRAM_CLIP_MIN_BPS floor)
+//         visitor gone before the clip could start: no clip, no window ~0.7 mAh
+//       So budget ~3-4 mAh for a person who gets no reply. The window is
+//       about a sixth of it, the price of being able to say "keep".
+//   (c) a long "keep" visit that reaches the fuse: photo, 30 clips, a window
+//       after the first                             ~0.7 + 30 x 4.2 + <=0.6 = ~127 mAh
+//       (~244 mAh if every upload crawls at the floor)
+// A "stop" answer costs what (b) costs, less what is left of the window.
+// The node is awake at ~250 mA for the whole of a kept visit, so the rule of
+// thumb there is ~4.2 mAh per minute of presence, however it splits between
+// recording and uploading. The fuse bounds clips, not minutes: 30 clips span
+// ~30 min awake at ~200 kB/s and ~58 min at the floor.
 //
-// Recording the whole visit is expensive BY DESIGN. A long genuine visit costs
-// what it costs, ~4 mAh a minute; the fuse is there to stop a stuck-on radar,
-// not to ration visitors.
+// Per day, against 7's ~9 mAh: sleep alone is now ~8.9 of it with the radar
+// (was 8.2; Sleep current, under Pins), and the four telemetry reports of a
+// quiet day add ~1, so even a day with no visitor runs ~10 mAh. One unanswered
+// visitor (b) adds ~3-4. The worst case the firmware still bounds is the fuse,
+// and it is NOT the long kept visit: it is 30 separate unanswered visits that
+// each fill a 30 s clip, since each pays its own photo and window:
+//   30 x 5.5 + 8.9 = ~174 mAh/day (30 x 9.4 + 8.9 = ~291 at the floor)
+// against ~136 (~253) for one kept visit that reaches the fuse (a day that
+// sends this much owes no telemetry report). That worst day is ~5% (~9%) of
+// the cell; a node that lived there would last ~20 days (~12), not a year.
+// Past the fuse no clip is recorded and no window opens, but each further
+// confirmed visit still costs its photo, ~0.7 mAh, and nothing caps how many
+// of those a day brings. The old limits (3 clips a visit, 3 a day) held the
+// worst case near 22 mAh/day (~33 at the floor).
+//
+// Recording the whole visit is expensive BY DESIGN, and since the reply window
+// it happens only when someone asks for it. A long kept visit costs what it
+// costs, ~4 mAh a minute; the fuse is there to stop a stuck-on radar or a
+// pathological day, not to ration visitors.
 // ---------------------------------------------------------------------------
 #define VIDEO_ENABLED                1
 // Never above HD, the usual limit for M-JPEG playback on phones; main.cpp
@@ -508,7 +536,8 @@
 // this, recording is refused (for that episode and the ones after it, until the
 // oldest clip is 24 h old); the entry photo still goes out. Every refusal is
 // counted and reported ("clip fuse ... TRIPPED" in the caption and on the
-// status page). A fuse day costs ~135 mAh: see the energy note above.
+// status page). A fuse day costs ~136-174 mAh (~253-291 at the upload floor):
+// see the energy note above.
 #define VIDEO_MAX_CLIPS_PER_DAY      30
 
 // ---------------------------------------------------------------------------
