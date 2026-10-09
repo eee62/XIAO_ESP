@@ -474,13 +474,16 @@
 // Per episode, the three that matter:
 //   (a) no person: one capture and a detection, nothing sent         ~0.2 mAh
 //   (b) person, NO REPLY, the common case: photo, the one clip a visit without
-//       "keep" gets, then the whole window:
-//         ~10 s clip                         ~0.6-0.7 + 1.8-2.6 + 0.5-0.6 = ~2.9-3.9 mAh
-//         clip filling its 30 s cap                       ~0.7 + 4.2 + 0.6 = ~5.5 mAh
-//           (~9.4 at the TELEGRAM_CLIP_MIN_BPS floor)
+//       "keep" gets, then the whole window if the visitor is still there:
 //         visitor gone before the clip could start: no clip, no window ~0.7 mAh
-//       So budget ~3-4 mAh for a person who gets no reply. The window is
-//       about a sixth of it, the price of being able to say "keep".
+//         short visit, ~10 s clip that ended as they left, so gone by the
+//           time it is delivered: no window       ~0.6-0.7 + 1.8-2.6 = ~2.4-3.3 mAh
+//         still there when the clip is delivered (a clip that filled its
+//           30 s cap): the whole window                   ~0.7 + 4.2 + 0.6 = ~5.5 mAh
+//           (~9.4 at the TELEGRAM_CLIP_MIN_BPS floor)
+//       So budget ~3 mAh for a short unanswered visit, ~5.5 for one that
+//       outlasts its first clip. The window, ~0.5-0.6 of the latter, is the
+//       price of being able to say "keep".
 //   (c) a long "keep" visit that reaches the fuse: photo, 30 clips, a window
 //       after the first                             ~0.7 + 30 x 4.2 + <=0.6 = ~127 mAh
 //       (~244 mAh if every upload crawls at the floor)
@@ -493,7 +496,7 @@
 // Per day, against 7's ~9 mAh: sleep alone is now ~8.9 of it with the radar
 // (was 8.2; Sleep current, under Pins), and the four telemetry reports of a
 // quiet day add ~1, so even a day with no visitor runs ~10 mAh. One unanswered
-// visitor (b) adds ~3-4. The worst case the firmware still bounds is the fuse,
+// visitor (b) adds ~3, or ~5.5 if they stay past the first clip. The worst case the firmware still bounds is the fuse,
 // and it is NOT the long kept visit: it is 30 separate unanswered visits that
 // each fill a 30 s clip, since each pays its own photo and window:
 //   30 x 5.5 + 8.9 = ~174 mAh/day (30 x 9.4 + 8.9 = ~291 at the floor)
@@ -616,7 +619,13 @@
 // full once the first clip is counted, since no second clip could follow, nor
 // when neither the photo's nor the clip's message_id came back. If the first
 // clip is never recorded (D1 already low once the photo is sent) or not
-// delivered, there is no window either.
+// delivered, there is no window either. Nor is there when D1 is low once the
+// first clip has been delivered: the radar has seen nobody for at least
+// RADAR_UNMANNED_DELAY_S, so the visitor has gone and there is no second clip
+// to ask about. That is most short visits, whose clip ended on presence
+// ending. The clip's caption has already invited an answer by then; one sent
+// anyway is simply never read. Skipped windows are not counted in the replies
+// telemetry, which counts only windows that opened.
 //
 // Every confirmed visit opens the window: a person in a detect build, a frame
 // the detector could not judge (fail open), and every episode in

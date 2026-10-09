@@ -2323,9 +2323,19 @@ static void video_run()
 		const bool sent = send_clip(c, ask ? &clip_ref : nullptr);
 		heap_caps_free(c.buf);
 		if (sent && ask) {
-			const bool clean = reply_window(clip_ref);
-			wifi_down();
-			reply_counted(clean);
+			if (gpio_get_level(PIN_PIR) == 0) {
+				// The radar no longer sees anyone, and has not for at least
+				// RADAR_UNMANNED_DELAY_S: the visitor has gone, so there is no
+				// second clip to ask about (config.h, Reply window). Not
+				// counted as a window in the report.
+				log_i("visit #%s: D1 low once the first clip is delivered; "
+				      "no reply window", rtc_ep.tag);
+				wifi_down();
+			} else {
+				const bool clean = reply_window(clip_ref);
+				wifi_down();
+				reply_counted(clean);
+			}
 		}
 
 		if (!sent) {
