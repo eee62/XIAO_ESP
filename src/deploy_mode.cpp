@@ -535,7 +535,7 @@ justify-content:center}
 </section>
 
 <section class="card">
-  <div class="sec">Cold capture &mdash; what a PIR wake produces</div>
+  <div class="sec">Cold capture &mdash; what a presence wake produces</div>
   <div class="grid" id="cold"><div>Result</div><div>not run yet</div></div>
   <div class="row"><button id="coldbtn">Run cold capture</button></div>
   <div class="grid" id="clip" style="margin-top:12px"></div>
@@ -544,7 +544,7 @@ justify-content:center}
 
 <section class="card pir">
   <div class="dot" id="pirdot"></div>
-  <b id="pirtxt">PIR idle</b>
+  <b id="pirtxt">Radar idle</b>
   <span id="pirsub">&mdash;</span>
 </section>
 
@@ -627,7 +627,7 @@ function drawCentre(im){
   $('fsub').textContent='centre '+w+'×'+h+' of '+im.naturalWidth+'×'+
     im.naturalHeight+', 1:1'}
 
-// Cold capture: the loop task cuts the rail, then runs the PIR wake's photo
+// Cold capture: the loop task cuts the rail, then runs the presence wake's photo
 // path. The result arrives as a new seq on GET /coldtest.
 function gridRows(id,a){$(id).innerHTML=a.map(function(r){
   return'<div>'+r[0]+'</div><div>'+r[1]+'</div>'}).join('')}
@@ -652,7 +652,7 @@ function coldShow(d){
     d.det=='error'?'ERROR: could not judge (sent unjudged in the field)':
     (d.det=='hit'?'PERSON, score ':'no person, best ')+d.score.toFixed(2);
   var r=[['Result','captured'],
-    ['Wake-to-shutter',d.w2s+' ms from rail on (a PIR wake adds its boot)'],
+    ['Wake-to-shutter',d.w2s+' ms from rail on (a presence wake adds its boot)'],
     ['Capture',d.cap_ms+' ms, rail on to rail off'],
     ['JPEG',kb1(d.len)+' · quality '+d.q],['Detection',det]];
   if(d.det!='off'&&d.det!='error'||d.dec_ms)
@@ -693,7 +693,7 @@ function act(path,label,confirmText){
   fetch(path,{method:'POST'}).then(function(){toast(label)})
     .catch(function(){toast(label)})}
 $('arm').onclick=function(){act('/arm','Arming — node will sleep',
-  'Leave deployment mode and start the normal PIR duty cycle?')}
+  'Leave deployment mode and start the normal radar duty cycle?')}
 $('reboot').onclick=function(){act('/reboot','Rebooting',
   'Reboot the node? It will come back in normal mode.')}
 
@@ -705,7 +705,7 @@ function render(d){
     ' · '+location.host;
 
   $('pirdot').className='dot'+(d.pir?' hot':'');
-  $('pirtxt').textContent=d.pir?'PIR ACTIVE':'PIR idle';
+  $('pirtxt').textContent=d.pir?'PRESENCE (radar)':'Radar idle';
   $('pirsub').innerHTML=d.pir_edges+' trip'+(d.pir_edges==1?'':'s')+
     ' this session<br>'+(d.pir_edges?('last '+dur(d.uptime-d.pir_last)+' ago'):
     'walk-test the field of view')+
@@ -739,7 +739,7 @@ function render(d){
   row('Gate',(d.persons_only?'entry photo must hold a person':'off, everything')+
     ' · '+d.per_ep+' photo per visit');
   row('Presence timing','quiet window '+d.quiet+' s · visit gap '+d.gap+' s');
-  row('Wind',d.backoff_left?'PIR ignored for '+dur(d.backoff_left)+' more':
+  row('Wind',d.backoff_left?'Radar ignored for '+dur(d.backoff_left)+' more':
     (d.wind_streak?d.wind_streak+' empty photos in a row':'calm')+
     (d.backoff_total?' · ignored '+dur(d.backoff_total)+' so far':''));
   row('Detection',d.model+(d.model=='disabled'?'':' @ '+d.thr));
@@ -1074,7 +1074,7 @@ void deploy_mode_begin()
 
 // ---------------------------------------------------------------------------
 // Service tick — owns camera power and size, stills, the cold-capture test,
-// the PIR walk test and deferred actions.
+// the presence walk test and deferred actions.
 // ---------------------------------------------------------------------------
 static void service_camera()
 {
@@ -1200,9 +1200,9 @@ static bool job_take_camera(uint32_t req_ms, bool *refused)
 	return true;
 }
 
-// The cold-capture test: rail off for DEPLOY_COLDTEST_OFF_MS, then the PIR
-// wake's photo path (deploy_cold_test() in main.cpp). Blocks this task for
-// the few seconds it takes; the captive DNS and the PIR walk test wait.
+// The cold-capture test: rail off for DEPLOY_COLDTEST_OFF_MS, then the
+// presence wake's photo path (deploy_cold_test() in main.cpp). Blocks this task
+// for the few seconds it takes; the captive DNS and the presence walk test wait.
 static void service_coldtest()
 {
 	if (!g_cold_req) {

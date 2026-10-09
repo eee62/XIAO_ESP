@@ -4,7 +4,7 @@
 // deployment-mode block in config.h for the entry procedure and why the button
 // cannot be sampled at the reset edge). In this mode the node never sleeps: it
 // raises a WPA2 AP and serves an async web UI on 192.168.4.1 for aiming the
-// lens, walk-testing the PIR and reading the RTC telemetry counters.
+// lens, walk-testing the radar and reading the RTC telemetry counters.
 //
 // Split out of main.cpp so the normal duty cycle stays readable. The two
 // halves meet only through the small surface below.
@@ -16,7 +16,7 @@
 // ---------------------------------------------------------------------------
 // Provided by main.cpp. Deployment mode reuses the real camera bring-up rather
 // than configuring its own sensor, so what the preview shows is exactly what a
-// PIR capture would have produced.
+// presence capture would have produced.
 // ---------------------------------------------------------------------------
 bool     camera_up();
 void     camera_down();
@@ -39,8 +39,8 @@ struct deploy_status_t {
 	uint32_t photos_dropped_total;
 	uint32_t capped_total;                // edges inside a visit that has its photo
 	uint8_t  wind_streak;                 // no-person photos in a row
-	uint32_t backoff_left_s;              // 0 unless the PIR is being ignored
-	uint32_t backoff_s_total;             // seconds the PIR has been ignored
+	uint32_t backoff_left_s;              // 0 unless the radar is being ignored
+	uint32_t backoff_s_total;             // seconds the radar has been ignored
 	uint32_t clips_sent_total;
 	uint32_t clips_dropped_total;         // recorded, not delivered
 	uint32_t clip_s_total;                // seconds of clip recorded
@@ -61,7 +61,7 @@ struct deploy_status_t {
 
 void deploy_fill_status(deploy_status_t *out);
 
-// The PIR wake's photo path on demand, for the cold-capture test: capture()
+// The presence wake's photo path on demand, for the cold-capture test: capture()
 // from a dead rail (power on, cold init, warm-up, one frame, rail off), then
 // detection on that frame. Loop task only, with the camera already down.
 enum {
@@ -86,7 +86,7 @@ struct cold_test_t {
 void deploy_cold_test(cold_test_t *out);
 
 // A DEPLOY_TEST_CLIP_S clip with the presence-video settings (config.h,
-// VIDEO_*), the PIR ignored, for the test-clip button. Loop task only, with
+// VIDEO_*), D1 ignored, for the test-clip button. Loop task only, with
 // the camera already down.
 struct test_clip_t {
 	bool     ok;

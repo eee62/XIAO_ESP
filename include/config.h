@@ -143,7 +143,7 @@
 // Sensor settings, applied by camera_apply_settings() after every init: the
 // rail is cut between captures, so each wake starts from the driver's register
 // table (9.1 step 3). Deployment mode's preview goes through the same
-// camera_up(), so what it shows is what a PIR capture gets.
+// camera_up(), so what it shows is what a presence capture gets.
 //
 // Each default is the value the installed ov5640.c's register table already
 // loads, checked setter by setter, so a stock build writes nothing new. Only
@@ -202,7 +202,9 @@
 //   1, 8  The presence sensor is an LD2410S radar, its OT2 output on PIN_PIR,
 //         not the AM312 PIR. A radar holds OT2 high for its own unmanned delay
 //         after the last presence, as the PIR held its output after the last
-//         motion, so "D1 high" still means present-or-just-was.
+//         motion, so "D1 high" still means present-or-just-was. Unlike the
+//         PIR it also holds OT2 high for as long as someone stays in range,
+//         standing still included.
 //   9.1   "Return to deep sleep" after one photo no longer holds for a visit
 //         the AI confirms: the node stays awake and records until the radar
 //         says the visit is over. The order inside the wake does hold: camera
@@ -289,13 +291,13 @@
 // walking right out of the radar's range, should read about this.
 #define RADAR_UNMANNED_DELAY_S 10
 
-// Wind backoff. A branch in wind retriggers the PIR all day and never holds
-// a person. After WIND_STREAK_BACKOFF photos in a row judged "no person", the
-// node stops listening to the PIR for WIND_BACKOFF_MIN_S, doubling after each
-// further such photo up to WIND_BACKOFF_MAX_S, and wakes on the timer alone.
-// When the backoff ends the PIR is armed again; if D1 is still high, that is
-// a trigger at once, so steady wind costs one capture per backoff period.
-// A person photo ends it, and so does WIND_QUIET_RESET_S of listening
+// Wind backoff. A branch in wind can retrigger the radar all day and never
+// hold a person. After WIND_STREAK_BACKOFF photos in a row judged "no person",
+// the node stops listening to the radar for WIND_BACKOFF_MIN_S, doubling after
+// each further such photo up to WIND_BACKOFF_MAX_S, and wakes on the timer
+// alone. When the backoff ends D1's wake is armed again; if D1 is still high,
+// that is a trigger at once, so steady wind costs one capture per backoff
+// period. A person photo ends it, and so does WIND_QUIET_RESET_S of listening
 // without a single trigger.
 //
 // What that bounds, at ~0.18 mAh a capture, in wind that never stops:
@@ -303,8 +305,8 @@
 //   WIND_BACKOFF_MAX_S  1800: 48 captures/day,  ~9 mAh/day, 30 min deaf
 //   WIND_BACKOFF_MAX_S  3600: 24 captures/day,  ~4 mAh/day, 60 min deaf
 // Deaf means just that: a person who arrives mid-backoff is photographed
-// when it ends, if D1 is still high then. Telemetry reports the time the PIR
-// was ignored rather than inventing trigger counts for it. bench-nodetect has
+// when it ends, if D1 is still high then. Telemetry reports the time the
+// radar was ignored rather than inventing trigger counts for it. bench-nodetect has
 // no detector, so no streak, so no backoff.
 #define WIND_STREAK_BACKOFF    3
 #define WIND_BACKOFF_MIN_S     60
@@ -689,9 +691,9 @@
 //
 // This drives a real wake: enter_deep_sleep() arms the RTC timer for whatever
 // is left of this period since the last report *attempt*, so a node that sees
-// no motion at all still reports. That is the quiet-vs-mute case in 9.6.
+// no presence at all still reports. That is the quiet-vs-mute case in 9.6.
 // Each report is a full association plus TLS handshake, a few tenths of a
-// mAh. A day with no motion pays for four of them, roughly a tenth of the 7
+// mAh. A day with no presence pays for four of them, roughly a tenth of the 7
 // daily budget, and that cost is accepted. Days with photos pay less, because
 // every send restarts the clock. Counting from the attempt rather than the
 // last success means an uplink outage costs one try per period, not one per
@@ -810,7 +812,7 @@
 // Deployment mode — held-BOOT-button setup/aiming interface.
 //
 // Not in PROJECT_BRIEF.md: this is an operator-facing mode for siting the node
-// (aim the lens, walk-test the PIR, read telemetry) without a laptop or a
+// (aim the lens, walk-test the radar, read telemetry) without a laptop or a
 // serial cable. It never sleeps and it is never entered by accident, so none
 // of the power budget in 7 applies to it.
 //
@@ -823,15 +825,15 @@
 //   until the LED-free "deployment mode" line appears on serial / the
 //   CAM-SETUP AP shows up (~1 s).
 //
-// Held at a PIR wake it is also honoured, so an already-deployed node can be
-// put back into setup mode by waving at the PIR with BOOT held — no power
-// cycle needed.
+// Held at a presence wake it is also honoured, so an already-deployed node can
+// be put back into setup mode by stepping in front of the radar with BOOT held
+// — no power cycle needed.
 // ---------------------------------------------------------------------------
 #define PIN_DEPLOY_BUTTON     GPIO_NUM_0  // XIAO BOOT button, shorts IO0 to GND
 #define DEPLOY_BUTTON_ACTIVE  0           // active-low; the XIAO pulls IO0 up
 
 // How long after boot we keep watching for the press to *start*. A press
-// already in progress is always seen through to its verdict, so a PIR or
+// already in progress is always seen through to its verdict, so a presence or
 // telemetry-timer wake passes 0 here and pays a single GPIO read when nothing
 // is held.
 #define DEPLOY_ENTRY_WINDOW_MS   3000
@@ -888,7 +890,7 @@
 
 // Cold-capture test: the rail is held off this long before the test powers
 // it back up, so the sensor and its decoupling genuinely lose power, as they
-// do between PIR wakes (9.1 step 3).
+// do between presence wakes (9.1 step 3).
 #define DEPLOY_COLDTEST_OFF_MS    1000
 
 // Deployment mode's test clip: this many seconds with the current VIDEO_*

@@ -156,9 +156,9 @@ struct episode_t {
 };
 RTC_DATA_ATTR static episode_t rtc_ep;
 
-// Wind backoff (config.h). While rtc_backoff is set the PIR is not armed at
+// Wind backoff (config.h). While rtc_backoff is set D1's wake is not armed at
 // all and only the timer wakes the node, at rtc_backoff_end_s. rtc_listen_s
-// is the last trigger, or the moment the PIR was armed again after a backoff:
+// is the last trigger, or the moment D1 was armed again after a backoff:
 // WIND_QUIET_RESET_S counts from it.
 RTC_DATA_ATTR static uint8_t  rtc_wind_streak     = 0;
 RTC_DATA_ATTR static uint8_t  rtc_backoff_level   = 0;
@@ -166,7 +166,7 @@ RTC_DATA_ATTR static bool     rtc_backoff         = false;
 RTC_DATA_ATTR static uint32_t rtc_backoff_start_s = 0;
 RTC_DATA_ATTR static uint32_t rtc_backoff_end_s   = 0;
 RTC_DATA_ATTR static uint32_t rtc_listen_s        = 0;
-// Seconds the PIR was ignored, for the report (9.3): the honest stand-in for
+// Seconds the radar was ignored, for the report (9.3): the honest stand-in for
 // the triggers that could not be counted meanwhile.
 RTC_DATA_ATTR static uint32_t rtc_backoff_s_total = 0;
 RTC_DATA_ATTR static uint32_t rtc_backoff_s_since_report = 0;
@@ -724,7 +724,7 @@ static bool judge_frame(frame_t &f)
 
 // ---------------------------------------------------------------------------
 // Deployment mode's cold-capture test (deploy_mode.h). The same capture() and
-// detection a PIR wake runs, so what it reports is what the field gets, minus
+// detection a presence wake runs, so what it reports is what the field gets, minus
 // the boot before setup() that a real wake also pays.
 // ---------------------------------------------------------------------------
 void deploy_cold_test(cold_test_t *out)
@@ -1284,7 +1284,7 @@ static String telemetry_text(const char *reason, float score, int idx, int total
 		c += rtc_clip_fuse_trips_total;
 		c += "x";
 	}
-	c += "\nPIR ignored (wind) ";
+	c += "\nradar ignored (wind) ";
 	c += rtc_backoff_s_total;
 	c += " s (+";
 	c += rtc_backoff_s_since_report;
@@ -1445,9 +1445,9 @@ static void wait_for_pir_idle()
 		const esp_err_t serr = esp_light_sleep_start();
 		// Arming ext0 routed D1 to its RTC function, and nothing routes it
 		// back after a light sleep. Until it is, the gpio_get_level() above
-		// can read stale and end this wait with the AM312 still high; the
-		// level-triggered deep-sleep wake then fires at once and one walk-by
-		// logs as several triggers — exactly what the burst filter counts.
+		// can read stale and end this wait with OT2 still high; the
+		// level-triggered deep-sleep wake then fires at once and one visit
+		// logs as several triggers, each a wake and a boot.
 		rtc_gpio_deinit(PIN_PIR);
 		if (serr != ESP_OK) {
 			delay(1000);   // rejected; wait at CPU idle rather than spinning
@@ -1517,7 +1517,7 @@ static void park_for_sleep()
 // Never returns: ends in esp_deep_sleep_start(). Marked so the compiler
 // enforces that no caller falls through into code using stale state.
 //
-// The idle sleep: wake on the next PIR rising edge, or the telemetry timer.
+// The idle sleep: wake on the next rising edge on D1, or the telemetry timer.
 // Also the exit for abnormal resets and for deployment mode's arm, so it knows
 // nothing of episodes; the trigger flow uses sleep_for_state().
 [[noreturn]] void enter_deep_sleep()
@@ -1525,9 +1525,9 @@ static void park_for_sleep()
 	park_for_sleep();
 	wait_for_pir_idle();
 
-	// Wake for the periodic report even if nothing moves. Without this a node
-	// that sees no motion never reports, and a quiet node looks the same as a
-	// mute one (9.6). The wake goes through setup()'s non-PIR branch. By
+	// Wake for the periodic report even if nobody comes. Without this a node
+	// that sees no presence never reports, and a quiet node looks the same as a
+	// mute one (9.6). The wake goes through setup()'s timer path. By
 	// now_s() it can arrive slightly early, because the RC slow clock is
 	// recalibrated between arming and waking. telemetry_due() then says no,
 	// and the floor makes that one more short sleep, not a loop.
@@ -1563,8 +1563,8 @@ static void episode_close(const char *why)
 	rtc_ep.open = false;
 }
 
-// The PIR goes deaf for a while (config.h, wind backoff). Closes the episode:
-// with the PIR unarmed there is no following it.
+// The node stops listening to the radar for a while (config.h, wind
+// backoff). Closes the episode: with D1's wake unarmed there is no following it.
 static void backoff_start()
 {
 	const uint8_t  level = rtc_backoff_level < 16 ? rtc_backoff_level : 16;
@@ -1579,7 +1579,7 @@ static void backoff_start()
 	rtc_backoff_start_s = now_s();
 	rtc_backoff_end_s   = rtc_backoff_start_s + len;
 	episode_close("wind backoff");
-	log_w("wind: %u photos in a row without a person; PIR ignored for %lu s",
+	log_w("wind: %u photos in a row without a person; radar ignored for %lu s",
 	      rtc_wind_streak, (unsigned long)len);
 }
 
@@ -1591,7 +1591,7 @@ static void backoff_finish()
 	rtc_backoff_s_since_report += spent;
 	rtc_backoff  = false;
 	rtc_listen_s = t;   // WIND_QUIET_RESET_S counts from here
-	log_i("wind backoff over after %lu s; PIR armed", (unsigned long)spent);
+	log_i("wind backoff over after %lu s; D1 armed", (unsigned long)spent);
 }
 
 // One rising edge on D1 that opened an episode or continued one. Only the first
@@ -1829,7 +1829,7 @@ static bool record_clip(clip_t *out, uint32_t max_s, bool follow_pir)
 	out->buf    = buf;
 	out->end    = end;
 	log_i("clip: %lu frames, %.2f fps, %.1f s, %u bytes, ended on %s, "
-	      "%d PIR edges while recording", (unsigned long)out->frames, out->fps,
+	      "%d D1 edges while recording", (unsigned long)out->frames, out->fps,
 	      out->dur_ms / 1000.0f, (unsigned)out->len, CLIP_END_NAMES[end],
 	      out->pir_edges);
 	return true;
@@ -1996,7 +1996,7 @@ static void video_check()
 }
 
 // Deployment mode's test clip (deploy_mode.h): the same recorder as a
-// presence clip, with the PIR out of it.
+// presence clip, with D1 out of it.
 void deploy_test_clip(test_clip_t *out)
 {
 	memset(out, 0, sizeof(*out));
@@ -2027,7 +2027,7 @@ static uint32_t min_timer(uint32_t a, uint32_t b)
 }
 
 // Sleep until whatever the current state is waiting for. Never returns.
-//   backoff:           the timer alone, PIR unarmed
+//   backoff:           the timer alone, D1 unarmed
 //   episode, D1 high:  D1 falling
 //   episode, D1 low:   D1 rising (a retrigger), or the gap running out
 //   otherwise:         enter_deep_sleep(), the idle sleep
@@ -2087,8 +2087,8 @@ static void episode_event(bool d1, uint32_t t_ref_ms)
 // True once BOOT has been held low continuously for DEPLOY_BUTTON_HOLD_MS.
 // `window_ms` is how long to keep waiting for the press to *start*; a press
 // already under way is always seen through to its verdict. window_ms == 0
-// therefore costs one GPIO read when nothing is held, which is what the PIR
-// path needs — 9.4 budgets 1.5 s for the whole wake-to-sent window — and what
+// therefore costs one GPIO read when nothing is held, which is what the
+// presence wake needs — 9.4 budgets 1.5 s for the whole wake-to-sent window — and what
 // the telemetry timer's wake needs, since nobody is standing at the node then.
 //
 // Sampled here rather than at the reset edge because GPIO 0 is a strapping
@@ -2358,7 +2358,7 @@ void setup()
 
 	// Deployment mode, before anything else acts on the wake: a reset boot
 	// would otherwise spend the entry window on the air sending telemetry.
-	// PIR and telemetry-timer wakes only check for a press already held.
+	// Presence and telemetry-timer wakes only check for a press already held.
 	if (deploy_button_held((cause == ESP_SLEEP_WAKEUP_EXT0 ||
 	                        cause == ESP_SLEEP_WAKEUP_TIMER)
 	                           ? 0u : (uint32_t)DEPLOY_ENTRY_WINDOW_MS)) {
@@ -2379,7 +2379,7 @@ void setup()
 	if (cause != ESP_SLEEP_WAKEUP_EXT0 && cause != ESP_SLEEP_WAKEUP_TIMER) {
 		// Power-on or reset, not a real trigger. Report once so a node that
 		// has been reset in the field says so, then go to sleep.
-		log_i("wake cause %d (not PIR)", (int)cause);
+		log_i("wake cause %d (not presence or timer)", (int)cause);
 
 		// Unless the reset was the node falling over. RTC_DATA_ATTR state is
 		// reloaded on every reset except a deep-sleep wake, so after a
