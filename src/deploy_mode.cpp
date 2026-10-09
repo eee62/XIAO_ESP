@@ -154,6 +154,13 @@ static blob_ref          g_clip_avi;
 // to fall, sampled every SERVICE_TICK_MS: after one brief pass that is the
 // sensor's hold after the last presence (the radar's unmanned delay), which is
 // what lengthens a clip's tail beyond VIDEO_END_QUIET_S.
+//
+// PIR-era assumption, kept as it is: "one brief pass" reads as the hold time
+// only if the tester leaves the radar's range altogether. The AM312 dropped its
+// output ~10 s after the last movement wherever the tester then stood; the
+// radar keeps OT2 high for anyone still in range, moving or not, so a tester
+// who stops a few metres off reads a longer "last high", or none until they
+// leave.
 static bool     g_pir_level       = false;
 static uint32_t g_pir_edges       = 0;
 static uint32_t g_pir_last_edge_s = 0;
@@ -1359,6 +1366,12 @@ static void service_action()
 	}
 
 	log_i("armed over HTTP; entering the normal duty cycle");
+	// PIR-era assumption, kept as it is: enter_deep_sleep() waits at most
+	// PIR_IDLE_MAX_S for D1 to fall, then arms the active-high wake. An AM312
+	// fell ~10 s after the operator stopped moving; the radar holds OT2 for as
+	// long as the operator stays in range, so arming from beside the node
+	// sleeps with D1 still high, wakes at once, and starts a visit: a photo of
+	// the operator, which the detector will most likely pass, and a recording.
 	enter_deep_sleep();   // does not return
 }
 
