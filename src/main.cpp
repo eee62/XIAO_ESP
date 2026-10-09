@@ -2331,8 +2331,8 @@ void setup()
 #if PIR_INTERNAL_PULLDOWN
 	gpio_set_pull_mode(PIN_PIR, GPIO_PULLDOWN_ONLY);
 #else
-	// The AM312 drives D1 both ways; a pull would only divide its high
-	// against R2 (config.h, PIR_INTERNAL_PULLDOWN).
+	// The radar's OT2 is push-pull and drives D1 both ways; a pull would only
+	// burn current while it is high (config.h, PIR_INTERNAL_PULLDOWN).
 	gpio_set_pull_mode(PIN_PIR, GPIO_FLOATING);
 #endif
 

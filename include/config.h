@@ -28,24 +28,33 @@
 // radar whose OT2 digital output drives it instead, active-high like the
 // AM312 was; the brief predates the radar and is not edited (12 already
 // anticipates a sensor swap on the same GPIO). The PIR_* and "PIR" names in
-// the code are that history: they mean this input. Comments that argue from
-// the AM312's electrical behaviour (PIR_INTERNAL_PULLDOWN) were written for it.
+// the code are that history: they mean this input. PIR_INTERNAL_PULLDOWN below
+// argues from the radar's output, not the AM312's.
 #define PIN_PIR        GPIO_NUM_2  // D1, RTC-capable, ext0 wake, active-high
 #define PIN_CAM_POWER  GPIO_NUM_1  // D0, drives the 2N3904 base
 
-// Whether D1 gets the ESP32-S3's internal pulldown. Leave it at 0.
+// Whether D1 gets the ESP32-S3's internal pulldown. Leave it at 0: no internal
+// pull is needed, up or down.
 //
-// The AM312's output is push-pull, so it pulls D1 low by itself and needs no
-// help. It is also not a bare CMOS pin: the module runs the sensor from its
-// own 3.0 V regulator and feeds Vout through a 20 k series resistor (R2).
-// Against the ~45 k internal pulldown that is a divider, and a triggered PIR
-// then gives 3.0 V x 45 / (45 + 20) = ~2.1 V at D1 — under the 0.75 x VDD =
-// ~2.5 V the S3 needs for a guaranteed high, on the node's only wake input
-// (9.1).
+// The LD2410S's OT2 is a push-pull 0-3.3 V output wired straight to D1, with
+// nothing in series. It drives D1 low when nobody is there and high when
+// somebody is, so the line never floats while the radar is powered and a pull
+// has nothing to hold. Its high is the radar's own 3.3 V, over the
+// 0.75 x VDD = ~2.5 V the S3 needs for a guaranteed high on the node's only
+// wake input (9.1).
 //
-// If a broken-wire failsafe is wanted (D1 left floating), fit it outside:
-// >= 1 M from D1 to GND still leaves ~2.9 V at D1 when triggered. The
-// internal pull is too strong for the job.
+// The reason this used to be 0 is gone. The AM312 module fed its output
+// through a 20 k series resistor (R2), which made a divider with the ~45 k
+// pull and left a triggered PIR at ~2.1 V, under that threshold. With no series
+// resistor there is no divider, so the pull would no longer break the high, but
+// it would cost: ~45 k against a driven 3.3 V is ~73 uA for as long as OT2 is
+// high. A radar holds OT2 high for as long as someone stands in range, and the
+// node deep-sleeps through that inside an episode (sleep_for_state()), so the
+// pull would add a fifth again to the sleep budget in 7 for those hours.
+//
+// If a broken-wire failsafe is wanted (D1 left floating if the lead comes
+// off), fit it outside: >= 1 M from D1 to GND costs ~3.3 uA while OT2 is high
+// and leaves the high untouched. The internal pull is too strong for the job.
 #define PIR_INTERNAL_PULLDOWN  0
 
 // PROJECT_BRIEF.md 5: HIGH = NPN conducts = FET on = camera powered.
