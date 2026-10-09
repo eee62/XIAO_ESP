@@ -519,7 +519,7 @@
 // A confirmed visit goes photo, first clip, window: the entry photo is sent
 // and the first clip is recorded at once, exactly as before the window
 // existed. Once that clip is delivered, the radio stays up on the same
-// association for up to REPLY_WAIT_S, and the node reads the
+// association for up to REPLY_WAIT_S, in modem sleep, and the node reads the
 // Bot API's getUpdates for an answer. The answer decides the SECOND clip:
 //   "keep" or "yes"  carry on: clips back to back for as long as the radar
 //                    shows presence, no limit per visit (the daily fuse,
@@ -571,7 +571,13 @@
 // REPLY_POLL_MARGIN_S before then. The wake deadline counts the window inside
 // the first clip's cycle, at REPLY_WAIT_S plus 2 s for the CPU-bound steps
 // between those checks.
-
+//
+// Modem sleep (WIFI_PS_MIN_MODEM) for the window only: the radio sleeps
+// between the AP's DTIM beacons instead of listening throughout, and the AP
+// holds anything for the node until the next one, so an answer arrives a
+// beacon (~100-300 ms) late at worst and the handshakes take a little longer.
+// Every other transfer keeps WIFI_PS_NONE (wifi_begin_async()), so uploads are
+// not slowed. The energy note under Presence video has the saving.
 //
 // Needs WIFI_VALIDATE_STATIC (that lookup is where the address comes from)
 // and a numeric TELEGRAM_CHAT_ID: with an "@channel" id no update's chat can

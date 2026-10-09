@@ -1762,8 +1762,15 @@ static bool reply_window(const tg_sent_t &clip)
 		return false;
 	}
 	rtc_ep.asked = true;
-	log_i("reply window: open for %d s on visit #%s (photo %lld, clip %lld)",
-	      REPLY_WAIT_S, rtc_ep.tag, (long long)ref.photo_msg_id,
+	// Modem sleep for the wait (config.h): the radio wakes for the AP's DTIM
+	// beacons instead of listening throughout. The AP holds anything addressed
+	// to the node until the next one, so an answer arrives a beacon late at
+	// worst; every wait below is on the deadline, not on a packet's timing.
+	if (!WiFi.setSleep(WIFI_PS_MIN_MODEM)) {
+		log_w("reply window: modem sleep refused; waiting at full power");
+	}
+	log_i("reply window: open for %d s on visit #%s (photo %lld, clip %lld), "
+	      "modem sleep", REPLY_WAIT_S, rtc_ep.tag, (long long)ref.photo_msg_id,
 	      (long long)ref.clip_msg_id);
 
 	// 1. What is there already. offset -N returns the newest N updates and has
@@ -1831,6 +1838,7 @@ static bool reply_window(const tg_sent_t &clip)
 		}
 		rtc_ep.reply = sc.reply;
 	}
+	WiFi.setSleep(WIFI_PS_NONE);
 	heap_caps_free(buf);
 	// Only ever the newest update seen (or, after a renumbering, the new
 	// line): nothing at or below it can count in a later window.
