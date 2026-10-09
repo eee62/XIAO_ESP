@@ -28,6 +28,7 @@
 
 // Before the conditional include below — it is what defines DEPLOY_CAPTIVE_DNS.
 #include "config.h"
+#include "netcfg.h"
 #include "telegram.h"
 
 #if DEPLOY_CAPTIVE_DNS
@@ -321,6 +322,28 @@ static String json_escape(const String &in)
 	return out;
 }
 
+// Home network card (netcfg.h). What the next wake's static fast path will use,
+// read once when deployment mode starts and kept up to date by the two POST
+// routes, so /status does not touch NVS on every poll. Only the async task
+// reads or writes it.
+static netcfg_t g_net;
+static bool     g_net_saved = false;
+
+static void net_refresh()
+{
+	g_net_saved = netcfg_load(&g_net);
+	if (!g_net_saved) {
+		netcfg_builtin(&g_net);
+	}
+}
+
+static String net_addr(uint32_t a)
+{
+	char b[16];
+	netcfg_format(a, b);
+	return String(b);
+}
+
 static String status_json()
 {
 	deploy_status_t s;
@@ -374,6 +397,9 @@ static String status_json()
 	j += ",\"last_report\":";   j += s.last_report_s;
 	j += ",\"ap_cache\":";      j += s.have_ap_cache ? "true" : "false";
 	j += ",\"net_mode\":\"";     j += s.using_dhcp ? "dhcp" : "static";
+	j += "\"";
+	j += ",\"net_ip\":\"";       j += net_addr(g_net.ip);
+	j += "\",\"net_src\":\"";    j += g_net_saved ? "saved" : "config.h";
 	j += "\"";
 	j += ",\"ap_ch\":";         j += s.ap_channel;
 	j += ",\"clients\":";       j += WiFi.softAPgetStationNum();
@@ -523,6 +549,10 @@ a{color:var(--accent)}
 justify-content:center}
 #fcv{display:block}
 .fsub{color:var(--dim);font-size:12px;margin-top:6px}
+.fld{display:flex;align-items:center;gap:10px;margin-top:8px}
+.fld label{flex:0 0 84px;color:var(--dim);font-size:13px}
+.fld input{flex:1;min-width:0;padding:8px;border-radius:7px;border:1px solid var(--line);
+background:#14161a;color:var(--fg);font:inherit;font-variant-numeric:tabular-nums}
 </style></head><body>
 
 <header><h1>Wildlife node</h1><small id="conn">connecting…</small></header>
@@ -563,6 +593,23 @@ justify-content:center}
 <section class="card">
   <div class="sec">Status</div>
   <div class="grid" id="stat"></div>
+</section>
+
+<section class="card">
+  <div class="sec">Home network &mdash; the node's address on your router</div>
+  <div class="grid" id="net"><div>In use</div><div>loading…</div></div>
+  <div class="fld"><label for="nip">IP address</label>
+    <input id="nip" inputmode="decimal" autocomplete="off" placeholder="192.168.1.50"></div>
+  <div class="fld"><label for="ngw">Gateway</label>
+    <input id="ngw" inputmode="decimal" autocomplete="off" placeholder="default: IP's first three + .1"></div>
+  <div class="fld"><label for="ndns">DNS</label>
+    <input id="ndns" inputmode="decimal" autocomplete="off" placeholder="default: the gateway"></div>
+  <div class="fld"><label for="nsn">Subnet</label>
+    <input id="nsn" inputmode="decimal" autocomplete="off" placeholder="default: 255.255.255.0"></div>
+  <div class="row">
+    <button id="netsave" class="on">Save</button>
+    <button id="netclear" class="warn">Forget saved IP</button>
+  </div>
 </section>
 
 <section class="card">
@@ -709,6 +756,28 @@ $('arm').onclick=function(){act('/arm','Arming — node will sleep',
 $('reboot').onclick=function(){act('/reboot','Rebooting',
   'Reboot the node? It will come back in normal mode.')}
 
+// Home network: GET /netcfg shows what the next wake will use; Save and Forget
+// answer with one line for the toast, an error when the node refused it.
+function netLoad(){fetch('/netcfg',{cache:'no-store'}).then(function(r){return r.json()})
+  .then(function(n){gridRows('net',[
+    ['In use',n.ip+' · '+(n.src=='saved'?'saved':'built-in (config.h)')],
+    ['Gateway · DNS',n.gw+' · '+n.dns],['Subnet',n.sn],
+    ['Built-in',n.builtin],
+    ['Wakes connect',n.dhcp?'by DHCP: the static address failed its check':
+      'with this static address']])})
+  .catch(function(){gridRows('net',[['In use','could not read']])})}
+function netPost(path,body){fetch(path,{method:'POST',body:body})
+  .then(function(r){return r.text()}).then(function(t){toast(t);netLoad()})
+  .catch(function(){toast('request failed')})}
+$('netsave').onclick=function(){var b=new URLSearchParams();
+  ['ip','gw','dns','sn'].forEach(function(k){
+    b.append(k,$({ip:'nip',gw:'ngw',dns:'ndns',sn:'nsn'}[k]).value.trim())});
+  netPost('/netcfg',b)}
+$('netclear').onclick=function(){
+  if(confirm('Forget the saved IP and go back to the built-in (config.h) address?'))
+    netPost('/netcfg/clear',null)}
+netLoad();
+
 var rows=[];
 function row(k,v){rows.push('<div>'+k+'</div><div>'+v+'</div>')}
 
@@ -759,7 +828,9 @@ function render(d){
     (d.backoff_total?' · ignored '+dur(d.backoff_total)+' so far':''));
   row('Detection',d.model+(d.model=='disabled'?'':' @ '+d.thr));
   row('Uplink',d.sta_ssid+' → Telegram '+(d.telegram?'ready':'NOT CONFIGURED'));
-  row('Network',d.net_mode);
+  row('Home IP',d.net_ip+' · '+(d.net_src=='saved'?'saved':'built-in (config.h)'));
+  row('Network',d.net_mode=='dhcp'?'DHCP (the static address failed its check)':
+    'static');
   row('AP cache',d.ap_cache?'ch '+d.ap_ch:'none (full scan next)');
   row('Free heap',kb(d.heap)+' (min '+kb(d.heap_min)+')');
   row('Free PSRAM',kb(d.psram_free)+' / '+kb(d.psram_size));
@@ -999,6 +1070,93 @@ static void install_routes()
 		req->send(res);
 	});
 
+	// Home network (netcfg.h). /netcfg/clear first: a plain "/netcfg" handler
+	// also matches "/netcfg/..." (the server's backward-compatible prefix
+	// rule), and handlers are tried in the order they are added.
+	g_server.on("/netcfg/clear", HTTP_POST, [](AsyncWebServerRequest *req) {
+		bool had = false;
+		if (!netcfg_clear(&had)) {
+			req->send(500, "text/plain", "Could not erase the saved IP (NVS error)");
+			return;
+		}
+		deploy_net_changed();
+		net_refresh();
+		req->send(200, "text/plain",
+		          (had ? "Forgot the saved IP; built-in " : "Nothing was saved; built-in ") +
+		              net_addr(g_net.ip) + " is in use");
+	});
+
+	g_server.on("/netcfg", HTTP_GET, [](AsyncWebServerRequest *req) {
+		netcfg_t b;
+		netcfg_builtin(&b);
+		deploy_status_t s;
+		deploy_fill_status(&s);
+		String j;
+		j.reserve(256);
+		j += "{\"src\":\"";       j += g_net_saved ? "saved" : "config.h";
+		j += "\",\"ip\":\"";      j += net_addr(g_net.ip);
+		j += "\",\"gw\":\"";      j += net_addr(g_net.gw);
+		j += "\",\"sn\":\"";      j += net_addr(g_net.sn);
+		j += "\",\"dns\":\"";     j += net_addr(g_net.dns);
+		j += "\",\"builtin\":\""; j += net_addr(b.ip);
+		j += "\",\"dhcp\":";      j += s.using_dhcp ? "true" : "false";
+		j += "}";
+		AsyncWebServerResponse *res = req->beginResponse(200, "application/json", j);
+		res->addHeader("Cache-Control", "no-store");
+		req->send(res);
+	});
+
+	// Checked here, not only in the page: four numbers 0-255 each, and the
+	// rules in netcfg_check(). Empty optional fields take their defaults.
+	g_server.on("/netcfg", HTTP_POST, [](AsyncWebServerRequest *req) {
+		auto field = [req](const char *name) -> String {
+			const AsyncWebParameter *p = req->getParam(name, true);
+			String v = p ? p->value() : String();
+			v.trim();
+			return v;
+		};
+		const String ip = field("ip"), gw = field("gw"), dns = field("dns"), sn = field("sn");
+		netcfg_t c = {};
+		const char *err = nullptr;
+		if (!ip.length()) {
+			err = "IP address is required";
+		} else if (!netcfg_parse_ip(ip.c_str(), &c.ip)) {
+			err = "IP address: four numbers 0-255, like 192.168.1.50";
+		} else if (gw.length() && !netcfg_parse_ip(gw.c_str(), &c.gw)) {
+			err = "Gateway: four numbers 0-255, like 192.168.1.1";
+		} else if (sn.length() && !netcfg_parse_ip(sn.c_str(), &c.sn)) {
+			err = "Subnet: four numbers 0-255, like 255.255.255.0";
+		} else if (dns.length() && !netcfg_parse_ip(dns.c_str(), &c.dns)) {
+			err = "DNS: four numbers 0-255, like 192.168.1.1";
+		} else {
+			if (!gw.length()) {
+				c.gw = netcfg_default_gw(c.ip);
+			}
+			if (!sn.length()) {
+				c.sn = NETCFG_DEFAULT_SN;
+			}
+			if (!dns.length()) {
+				c.dns = c.gw;
+			}
+			err = netcfg_check(c);
+		}
+		if (err) {
+			req->send(400, "text/plain", err);
+			return;
+		}
+		bool changed = false;
+		if (!netcfg_save(c, &changed)) {
+			req->send(500, "text/plain", "Could not save the IP (NVS error)");
+			return;
+		}
+		deploy_net_changed();
+		net_refresh();
+		log_i("net: home address %s saved%s", ip.c_str(), changed ? "" : " (unchanged)");
+		req->send(200, "text/plain",
+		          "Saved " + net_addr(c.ip) + " (gw " + net_addr(c.gw) +
+		              (changed ? "); used from the next wake" : "); it was already saved"));
+	});
+
 	g_server.on("/arm", HTTP_POST, [](AsyncWebServerRequest *req) {
 		g_action    = ACTION_ARM;
 		g_action_at = millis() + ACTION_DELAY_MS;
@@ -1049,6 +1207,7 @@ static bool cam_bring_up(cam_mode_t mode)
 void deploy_mode_begin()
 {
 	g_cam_lock = xSemaphoreCreateMutex();
+	net_refresh();
 
 	// Bring the sensor up before the first request arrives, so the page has a
 	// picture by the time it has finished loading. This also starts the idle

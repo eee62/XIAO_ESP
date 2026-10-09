@@ -65,6 +65,11 @@ struct deploy_status_t {
 
 void deploy_fill_status(deploy_status_t *out);
 
+// The Home network card saved or forgot an address (netcfg.h). Clears
+// rtc_use_dhcp, so the next wake tries the static path with what is now in
+// force rather than staying on DHCP over the old address's failure.
+void deploy_net_changed();
+
 // The presence wake's photo path on demand, for the cold-capture test: capture()
 // from a dead rail (power on, cold init, warm-up, one frame, rail off), then
 // detection on that frame. Loop task only, with the camera already down.

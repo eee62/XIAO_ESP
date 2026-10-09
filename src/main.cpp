@@ -48,6 +48,7 @@
 #include "avi.h"
 #include "config.h"
 #include "deploy_mode.h"
+#include "netcfg.h"
 #include "telegram.h"
 #include "tg_updates.h"
 
@@ -889,6 +890,50 @@ static void wifi_down()
 	s_tg_ip_ok       = false;
 }
 
+// The static block for the fast path (9.4): the address saved from deployment
+// mode's Home network card if there is one, else config.h's NET_* (netcfg.h).
+// Read from NVS at most once a wake, by wifi_begin_async() just before it
+// switches the station on, so the read adds no radio-on time and sits after
+// the capture like the rest of the radio work (9.1). Wakes that never
+// associate never read it.
+static bool     s_net_loaded = false;
+static bool     s_net_saved  = false;
+static netcfg_t s_net;
+
+static void net_load_once()
+{
+	if (s_net_loaded) {
+		return;
+	}
+	s_net_loaded = true;
+	const int64_t t0 = esp_timer_get_time();
+	s_net_saved = netcfg_load(&s_net);
+	if (!s_net_saved) {
+		netcfg_builtin(&s_net);
+	}
+	char ip[16];
+	netcfg_format(s_net.ip, ip);
+	log_i("net: static %s (%s), NVS read in %lld us", ip,
+	      s_net_saved ? "saved" : "config.h", (long long)(esp_timer_get_time() - t0));
+}
+
+static IPAddress to_ip(uint32_t a)
+{
+	return IPAddress((uint8_t)(a >> 24), (uint8_t)(a >> 16), (uint8_t)(a >> 8),
+	                 (uint8_t)a);
+}
+
+// Deployment mode saved or forgot a home address (deploy_mode.h). The next
+// wake tries the static path again, with whatever is now in force, instead of
+// going straight to DHCP on a verdict about the old address; if the new one
+// fails WIFI_VALIDATE_STATIC's lookup, the fallback below sets rtc_use_dhcp
+// again exactly as before.
+void deploy_net_changed()
+{
+	rtc_use_dhcp = false;
+	s_net_loaded = false;
+}
+
 static void wifi_ip_config(bool dhcp)
 {
 	if (dhcp) {
@@ -899,8 +944,9 @@ static void wifi_ip_config(bool dhcp)
 		WiFi.config(NET_ADDR_DHCP, NET_ADDR_DHCP, NET_ADDR_DHCP);
 		return;
 	}
-	IPAddress ip(NET_STATIC_IP), gw(NET_GATEWAY), sn(NET_SUBNET), dns(NET_DNS);
-	if (!WiFi.config(ip, gw, sn, dns)) {
+	net_load_once();   // a no-op here: wifi_begin_async() has read it
+	if (!WiFi.config(to_ip(s_net.ip), to_ip(s_net.gw), to_ip(s_net.sn),
+	                 to_ip(s_net.dns))) {
 		log_w("static IP config rejected; this attempt will use DHCP");
 	}
 }
@@ -975,6 +1021,9 @@ static void wifi_begin_async()
 		s_wifi_dhcp     = true;
 	}
 
+	if (!s_wifi_dhcp) {
+		net_load_once();   // before WiFi.mode() turns the radio on
+	}
 	WiFi.persistent(false);
 	wifi_set_hostname();
 	WiFi.mode(WIFI_STA);
