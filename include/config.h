@@ -234,8 +234,11 @@
 //                   detection and produce no traffic.
 //        can't run  Fail open: treated as a person (photo sent, recording
 //                   starts), counted as a detect error.
-//        person     Send the photo, the instant alert; then record.
-//   3. Record for as long as the radar shows presence (Presence video, below).
+//        person     Send the photo, the instant alert, tagged #TAG and asking
+//                   for an answer.
+//   3. Wait up to REPLY_WAIT_S for "keep" or "stop" (Reply window, below).
+//   4. Record: on "keep" for as long as the radar shows presence, otherwise
+//      one clip (Presence video, below).
 // There is no second look: no fresh check, no further photos
 // (PHOTOS_PER_EPISODE), no person gate on the video. The entry photo's result
 // stands for the episode. The old rule that held a clip back until
@@ -370,19 +373,22 @@
 // proxy redundant. The camera and the radio are never on together (9.1 step 5,
 // 10): record with the radio off and the camera off, then send.
 //
-// Back to back, with no limit per visit (VIDEO_MAX_CLIPS_PER_EPISODE is
-// removed). A clip ends at the first of:
+// On a "keep" answer to the entry photo (Reply window, below), back to back,
+// with no limit per visit (VIDEO_MAX_CLIPS_PER_EPISODE is removed). With
+// "stop" or no answer, the first clip is the visit's only one: it is recorded
+// and sent as below, and nothing follows it, not even after a retrigger
+// inside PRESENCE_GAP_S. A clip ends at the first of:
 //   - D1 low for VIDEO_END_QUIET_S, the quiet window: presence has ended. The
 //     radar's own unmanned delay (RADAR_UNMANNED_DELAY_S) is already inside
 //     OT2, so a clip runs on for that delay plus VIDEO_END_QUIET_S after the
 //     person leaves, 14 s at the defaults
 //   - VIDEO_MAX_CLIP_S
 //   - the buffer filling
-// A clip that ended on one of the last two is sent and, if D1 is still high,
-// the next starts straight away; so on for as long as the visit lasts.
-// Recording stops only when presence ends, when a send fails (the photo's or a
-// clip's: the uplink is down and the next clip would be dropped too), or at the
-// daily fuse below.
+// On "keep", a clip that ended on one of the last two is sent and, if D1 is
+// still high, the next starts straight away; so on for as long as the visit
+// lasts. Recording stops only when presence ends, when a send fails (the
+// photo's or a clip's: the uplink is down and the next clip would be dropped
+// too), at the daily fuse below, or, without "keep", after the first clip.
 //
 // At each clip boundary D1 is sampled once. Low means the visit ended while the
 // photo or the previous clip was being sent: no further clip. VIDEO_END_QUIET_S
@@ -396,11 +402,15 @@
 // radio never overlap, so the visit goes unrecorded during every upload. That
 // is about half of it at ~200 kB/s (30 s recorded, ~29 s uploading) and about a
 // quarter at the TELEGRAM_CLIP_MIN_BPS floor. And the first clip starts after
-// the entry photo is sent, because that photo is the instant alert. Boot,
+// the entry photo is sent and the reply window has closed, because that photo
+// is the instant alert and the camera stays off while the radio is up. Boot,
 // capture, detection, an association and an upload come first: roughly 8-13 s
-// from the edge to the first frame (an estimate from the figures in this file:
-// ~2 s to a photo in PSRAM, ~1 s of detection, ~4-9 s to send it, ~1 s of
-// camera bring-up; the log has the real times).
+// from the edge (an estimate from the figures in this file: ~2 s to a photo in
+// PSRAM, ~1 s of detection, ~4-9 s to send it, ~1 s of camera bring-up; the
+// log has the real times). The window adds up to REPLY_WAIT_S: with no answer,
+// the common case, the first frame is ~33-38 s after the edge, and a visit
+// shorter than that is never filmed at all. An early answer closes the window
+// early.
 //
 // The file is MJPEG in AVI (src/avi.cpp), built in one PSRAM buffer of
 // min(VIDEO_MAX_BYTES, free PSRAM - VIDEO_PSRAM_RESERVE, largest free block),
@@ -499,6 +509,97 @@
 // counted and reported ("clip fuse ... TRIPPED" in the caption and on the
 // status page). A fuse day costs ~135 mAh: see the energy note above.
 #define VIDEO_MAX_CLIPS_PER_DAY      30
+
+// ---------------------------------------------------------------------------
+// Reply window — not in PROJECT_BRIEF.md, and a departure from 9.6, which
+// only ever sends: the node now also reads the chat, for one short window per
+// visit.
+//
+// After a confirmed visit's entry photo is delivered, the radio stays up for
+// REPLY_WAIT_S and the node long-polls the Bot API's getUpdates for an answer:
+//   "keep" or "yes"  record the whole visit: clips back to back for as long as
+//                    the radar shows presence, no limit per visit (the daily
+//                    fuse, VIDEO_MAX_CLIPS_PER_DAY, still applies)
+//   "stop" or "no",  stop after the FIRST clip. That clip is always recorded
+//   or no answer     (if D1 is still high once the window closes) and always
+//                    sent: a reply never recalls footage, and no answer, the
+//                    common case, is the same as stop.
+// The window ends early on the first answer that counts. The camera is off
+// throughout (9.1 step 5, 10), so the first clip starts after it: up to
+// REPLY_WAIT_S later than it did before this window existed. A visitor who
+// has left by then gets no clip at all.
+//
+// How to answer: swipe-reply to the photo with keep or stop (a reply to the
+// bot's own message reaches it even in a group with privacy mode on), or send
+// "keep #TAG" / "/keep TAG" with the visit's tag from the caption. Case does
+// not matter; only the first word is read.
+//
+// What counts, so that nothing stale can start a recording (tg_updates.h has
+// the exact rules, and tools/tg_updates_host_test.sh checks them):
+//   - Each visit gets a random four-character tag (episode_open()), shown in
+//     the photo's and the clips' captions as #TAG.
+//   - An answer must be a new message (not an edit) from a person, in
+//     TELEGRAM_CHAT_ID, dated no earlier than the photo by Telegram's own clock
+//     (the photo's date comes back in the sendDocument response), and must
+//     reply to the photo's own message_id or carry the tag.
+//   - The last update_id processed is kept in RTC memory. When the window
+//     opens it first asks for the newest update with offset -1, which makes
+//     Telegram forget everything older, and counts only update_ids above that
+//     and above the RTC record. A backlog, or last visit's "keep" that was
+//     never confirmed, is behind the line before any answer is looked at.
+//     (Telegram restarts its numbering, lower, after a week with no updates;
+//     a newest update below the RTC record means that, and the newest update
+//     alone is the line.)
+//   - An answer that cannot be read whole counts as no answer.
+//
+// Never past REPLY_WAIT_S: every request in the window connects to the
+// address TELEGRAM_HOST resolved to on this association (no DNS, the one wait
+// lwIP will not cut short), gives the TCP connect, the handshake and the
+// request write a third of the time left each (the stall-timeout approach of
+// TELEGRAM_STALL_MS, scaled down), and waits for the response no later than
+// the window's end. The server's long poll is asked to answer
+// REPLY_POLL_MARGIN_S before then. The wake deadline counts the window at
+// REPLY_WAIT_S plus 2 s for the CPU-bound steps between those checks.
+//
+// Needs WIFI_VALIDATE_STATIC (that lookup is where the address comes from)
+// and a numeric TELEGRAM_CHAT_ID: with an "@channel" id no update's chat can
+// match, so every window would end with no answer. Both are checked when the
+// window opens; without them it does not open and the visit stops after its
+// first clip, as for no answer. It also does not open when the daily fuse is
+// already full, since no clip could follow, nor when the photo's message_id
+// and date did not come back.
+//
+// Every confirmed visit opens the window: a person in a detect build, a frame
+// the detector could not judge (fail open), and every episode in
+// bench-nodetect (no detector, so no gate) or with SEND_ONLY_PERSONS 0. On
+// bench-nodetect that means each visit costs the window's radio time too, and
+// a bench node with no reply from anyone records one clip per visit. That is
+// fine for 11 step 5's sleep-current measurement, which this does not touch.
+//
+// Telegram rules the setup must respect:
+//   - No webhook on the bot: getUpdates answers 409 while one is set. That is
+//     logged and the window ends with no answer.
+//   - One getUpdates reader per bot token. Several nodes sharing a token would
+//     each step the offset past the others' answers; give each node its own
+//     bot (they can share a chat, with TELEGRAM_CAPTION_PREFIX).
+//   - allowed_updates is sent as ["message"], which Telegram remembers for the
+//     bot until another getUpdates call changes it.
+//
+// 0 turns the window off. The node then never reads the chat, and with no way
+// to say "keep" or "stop" a confirmed visit records in full, as before the
+// window existed.
+#define REPLY_WAIT_S             25
+// Kept back from the server's long-poll timeout so its answer lands inside
+// the window.
+#define REPLY_POLL_MARGIN_S      2
+// No request starts with less than this left in the window: a third of it each
+// for connect, handshake and write must still be a workable second.
+#define REPLY_MIN_REQUEST_S      4
+// One getUpdates response body, in PSRAM while the window is open. Updates are
+// read one at a time (limit 1), and the largest single update is a 4096-
+// character message escaped as \uXXXX, plus the photo caption it replies to:
+// ~32 kB. A body that does not fit counts as no answer.
+#define REPLY_BUF_BYTES          (40 * 1024)
 
 // ---------------------------------------------------------------------------
 // WiFi — PROJECT_BRIEF.md 9.4: static IP and a cached BSSID/channel, so the
@@ -788,8 +889,14 @@
 //                                  fb_get() timeouts when a frame overflows
 //                                  its buffer), and a detection, allowed 10 s
 //   +  207 s  54 + 153 s           the entry photo (PHOTOS_PER_EPISODE): an
-//                                  association and a tg_post()
-//   = 286 s   against 360 s, 74 s to spare
+//                                  association and a tg_post(), whose reply
+//                                  body (the message_id the window needs) is
+//                                  read inside the same cap
+//   +   27 s  REPLY_WAIT_S + 2     the reply window on that association: every
+//                                  request in it is cut to fit REPLY_WAIT_S,
+//                                  and 2 s covers the CPU-bound steps between
+//                                  its checks (main.cpp, REPLY_WINDOW_MAX_S)
+//   = 313 s   against 360 s, 47 s to spare
 //
 // A wake that sends no photo (no person) and owes a bare report is shorter:
 // 29 + 54 + 92 s for the association and a small tg_post(), plus the 30 s

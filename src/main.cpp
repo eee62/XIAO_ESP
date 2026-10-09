@@ -49,6 +49,7 @@
 #include "config.h"
 #include "deploy_mode.h"
 #include "telegram.h"
+#include "tg_updates.h"
 
 #if DETECTION_ENABLED
 #include "dl_image_define.hpp"
@@ -100,6 +101,11 @@
 
 // Marks rtc_reset_stats as initialised; anything else in there is garbage.
 #define RESET_STATS_MAGIC 0x52535431u   // "RST1"
+
+// The reply window opens only where it can work (config.h, Reply window):
+// REPLY_WAIT_S 0 turns it off, there is nothing to keep without video, and
+// its requests use the address that WIFI_VALIDATE_STATIC's lookup resolves.
+#define REPLY_WINDOW_BUILT (REPLY_WAIT_S > 0 && VIDEO_ENABLED && WIFI_VALIDATE_STATIC)
 
 // ---------------------------------------------------------------------------
 // State that must survive deep sleep — RTC slow memory (9.2).
@@ -153,6 +159,9 @@ struct episode_t {
 	uint16_t clips;         // recorded; no limit per visit, the day fuse bounds it
 	uint64_t start_ms;      // now_ms() at the edge that opened it
 	uint64_t fall_ms;       // now_ms() when D1 last fell
+	char     tag[5];        // the visit's short id, #TAG in its captions
+	uint8_t  reply;         // TG_REPLY_*: the answer to the entry photo
+	bool     asked;         // the reply window ran for this visit
 };
 RTC_DATA_ATTR static episode_t rtc_ep;
 
@@ -184,6 +193,11 @@ RTC_DATA_ATTR static uint32_t rtc_clips_dropped_since_report = 0;
 RTC_DATA_ATTR static uint32_t rtc_clip_ms_total = 0;
 RTC_DATA_ATTR static uint32_t rtc_clip_ms_since_report = 0;
 RTC_DATA_ATTR static uint32_t rtc_clip_fuse_trips_total = 0;
+
+// The reply window (config.h): the highest Telegram update_id it has stepped
+// past, so that nothing at or below it can count as an answer; -1 before the
+// first window since power-on.
+RTC_DATA_ATTR static int64_t  rtc_tg_floor_update = -1;
 
 // Cached association parameters (9.4) — skips the scan on every wake.
 RTC_DATA_ATTR static bool     rtc_have_ap = false;
@@ -839,6 +853,11 @@ static bool     s_wifi_dhcp      = false;  // which phase is currently in flight
 static uint32_t s_wifi_t0        = 0;
 static bool     s_wifi_refresh   = false;  // the attempt in flight is a hostname refresh
 static bool     s_refresh_tried  = false;  // at most one refresh attempt per wake
+// TELEGRAM_HOST's address as wifi_reachable() resolved it on this association.
+// The reply window's requests connect to it, so none of them waits on DNS
+// (config.h, Reply window).
+static IPAddress s_tg_ip;
+static bool      s_tg_ip_ok      = false;
 
 static void wifi_down()
 {
@@ -846,6 +865,7 @@ static void wifi_down()
 	WiFi.mode(WIFI_OFF);
 	s_wifi_pending   = false;
 	s_wifi_connected = false;
+	s_tg_ip_ok       = false;
 }
 
 static void wifi_ip_config(bool dhcp)
@@ -982,6 +1002,8 @@ static bool wifi_reachable()
 	const uint32_t t0 = millis();
 	const bool ok = WiFi.hostByName(TELEGRAM_HOST, resolved) == 1;
 	if (ok) {
+		s_tg_ip    = resolved;
+		s_tg_ip_ok = true;
 		log_i("wifi: %s -> %s (%lu ms)", TELEGRAM_HOST,
 		      resolved.toString().c_str(), (unsigned long)(millis() - t0));
 	} else {
@@ -1340,7 +1362,11 @@ static void report_landed()
 // Send one photo: radio up, upload, radio down. The camera is already off
 // (9.1 step 5). Counted as sent before the caption is built, so the caption
 // includes it, and taken back if the upload fails.
-static bool send_photo(const frame_t &f, const char *reason)
+//
+// With `sent` (the reply window will follow, config.h) the caption asks for an
+// answer, the message's id and date come back in *sent, and a delivered photo
+// leaves the radio up for the window; the caller takes it down.
+static bool send_photo(const frame_t &f, const char *reason, tg_sent_t *sent)
 {
 	// Credentials before the radio. A node built without secrets.h should go
 	// straight back to sleep, not spend an association proving it cannot send.
@@ -1358,9 +1384,15 @@ static bool send_photo(const frame_t &f, const char *reason)
 		rtc_photos_sent_total++;
 		rtc_photos_sent_since_report++;
 		String why = reason;
-		why += "\nentry photo of this visit";
+		why += "\nentry photo of visit #";
+		why += rtc_ep.tag;
+		if (sent) {
+			why += "\nreply keep (whole visit) or stop (one clip) within ";
+			why += REPLY_WAIT_S;
+			why += " s";
+		}
 		const String cap = telemetry_text(why.c_str(), f.score, 0, 0);
-		ok = telegram_send_photo(f.data, f.len, cap);
+		ok = telegram_send_photo(f.data, f.len, cap, sent);
 		if (!ok) {
 			rtc_photos_sent_total--;
 			rtc_photos_sent_since_report--;
@@ -1368,7 +1400,9 @@ static bool send_photo(const frame_t &f, const char *reason)
 	} else {
 		log_w("no uplink");
 	}
-	wifi_down();
+	if (!ok || !sent) {
+		wifi_down();
+	}
 
 	if (ok) {
 		// Counters are cumulative "since last report" (9.3) — clear them only
@@ -1542,23 +1576,55 @@ static void park_for_sleep()
 // ---------------------------------------------------------------------------
 // Trigger flow (config.h) — replaces 9.2's isolated/burst rule
 // ---------------------------------------------------------------------------
+// Does this visit record in full (config.h, Reply window)? On "keep", or with
+// the window turned off; otherwise the first clip is the visit's only one.
+static bool visit_recorded_whole()
+{
+	return REPLY_WAIT_S == 0 || rtc_ep.reply == TG_REPLY_KEEP;
+}
+
+// What came of the reply window, for logs and captions.
+static const char *reply_name()
+{
+	if (REPLY_WAIT_S == 0) {
+		return "window off";
+	}
+	if (!rtc_ep.asked) {
+		return "no window";
+	}
+	return rtc_ep.reply == TG_REPLY_KEEP ? "keep" :
+	       rtc_ep.reply == TG_REPLY_STOP ? "stop" : "none";
+}
+
 static void episode_open()
 {
 	memset(&rtc_ep, 0, sizeof(rtc_ep));
 	rtc_ep.open     = true;
 	rtc_ep.d1_high  = true;
 	rtc_ep.start_ms = now_ms();
-	log_i("episode opened");
+	// The visit's tag (config.h, Reply window): four characters, no 0/O or
+	// 1/I to misread. Random, so a reply carrying another visit's tag cannot
+	// match this one; the date rule is what keeps old messages out.
+	static const char ALPHABET[] = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+	uint32_t r = esp_random();
+	for (int i = 0; i < 4; i++) {
+		rtc_ep.tag[i] = ALPHABET[r & 31];
+		r >>= 5;
+	}
+	rtc_ep.tag[4] = '\0';
+	log_i("episode opened, visit #%s", rtc_ep.tag);
 }
 
 static void episode_close(const char *why)
 {
 	if (rtc_ep.open) {
-		log_i("episode closed (%s) after %lu s, %u photo(s), %u clip(s), person %s",
+		log_i("episode #%s closed (%s) after %lu s, %u photo(s), %u clip(s), "
+		      "person %s, reply %s", rtc_ep.tag,
 		      why, (unsigned long)((now_ms() - rtc_ep.start_ms) / 1000),
 		      rtc_ep.photos, (unsigned)rtc_ep.clips,
 		      rtc_ep.person == EP_PERSON_YES ? "yes" :
-		      rtc_ep.person == EP_PERSON_NO  ? "no"  : "not checked");
+		      rtc_ep.person == EP_PERSON_NO  ? "no"  : "not checked",
+		      reply_name());
 	}
 	rtc_ep.open = false;
 }
@@ -1594,12 +1660,154 @@ static void backoff_finish()
 	log_i("wind backoff over after %lu s; D1 armed", (unsigned long)spent);
 }
 
+// ---------------------------------------------------------------------------
+// Reply window (config.h) — the one place the node reads the chat
+// ---------------------------------------------------------------------------
+static int clips_last_day();   // Presence video, below
+
+// May the window open for this visit? Asked before the photo goes out, so its
+// caption only invites an answer the node will wait for.
+static bool reply_window_wanted()
+{
+#if REPLY_WINDOW_BUILT
+	int64_t chat;
+	if (!tg_chat_id_number(TELEGRAM_CHAT_ID, &chat)) {
+		log_w("reply window: TELEGRAM_CHAT_ID is not numeric; no window");
+		return false;
+	}
+	if (clips_last_day() >= VIDEO_MAX_CLIPS_PER_DAY) {
+		log_i("reply window: the clip fuse is full, so no clip could follow; "
+		      "no window");
+		return false;
+	}
+	return true;
+#else
+	return false;
+#endif
+}
+
+// Wait up to REPLY_WAIT_S for "keep" or "stop" to the photo just sent
+// (`sent`), on the association that sent it. Sets rtc_ep.reply, which stays
+// TG_REPLY_NONE for no answer and for every failure: both mean stop after the
+// first clip. False when the window could not run or ended on an error. The
+// radio stays up; the caller takes it down.
+static bool reply_window(const tg_sent_t &sent)
+{
+#if REPLY_WINDOW_BUILT
+	rtc_ep.reply = TG_REPLY_NONE;
+	const uint32_t t_open   = millis();
+	const uint32_t deadline = t_open + (uint32_t)REPLY_WAIT_S * 1000u;
+
+	tg_episode_ref_t ref = {};
+	if (!sent.ok || !s_tg_ip_ok || !tg_chat_id_number(TELEGRAM_CHAT_ID, &ref.chat_id)) {
+		log_w("reply window: %s; no window, so the visit stops after one clip",
+		      !sent.ok    ? "the photo's message_id and date did not come back" :
+		      !s_tg_ip_ok ? "no resolved address for " TELEGRAM_HOST
+		                  : "TELEGRAM_CHAT_ID is not numeric");
+		return false;
+	}
+	ref.photo_msg_id = sent.message_id;
+	ref.photo_date   = sent.date;
+	ref.tag          = rtc_ep.tag;
+	ref.floor_update = rtc_tg_floor_update;
+
+	char *buf = (char *)heap_caps_malloc(REPLY_BUF_BYTES, MALLOC_CAP_SPIRAM);
+	if (!buf) {
+		log_e("reply window: no PSRAM for its %d-byte buffer; no window",
+		      REPLY_BUF_BYTES);
+		return false;
+	}
+	rtc_ep.asked = true;
+	log_i("reply window: open for %d s on visit #%s (photo message %lld)",
+	      REPLY_WAIT_S, rtc_ep.tag, (long long)sent.message_id);
+
+	// 1. The backlog. offset -1 returns the newest update and has Telegram
+	// forget every older one, so whatever was waiting before this photo is
+	// behind the line from here on. The newest one is still judged like any
+	// other: an answer quick enough to beat this request counts.
+	size_t    len = 0;
+	tg_scan_t sc  = {};
+	int code = telegram_get_updates(s_tg_ip, -1, 1, 0, deadline, buf,
+	                                REPLY_BUF_BYTES, &len);
+	bool failed = code != 200;
+	if (!failed) {
+		tg_scan_updates(buf, len, &ref, &sc);
+		if (sc.ok && sc.max_update_id >= 0 && sc.max_update_id < ref.floor_update) {
+			// Telegram renumbers, lower, after a week with no updates. The
+			// newest update is then the line, and the date and reference
+			// rules judge it on their own.
+			log_w("reply window: update %lld is below the last processed %lld; "
+			      "Telegram has renumbered", (long long)sc.max_update_id,
+			      (long long)ref.floor_update);
+			ref.floor_update = -1;
+			tg_scan_updates(buf, len, &ref, &sc);
+		}
+		failed = !sc.ok;
+	}
+	int64_t offset = 0;   // 0 is left out of the request
+	if (!failed) {
+		if (sc.max_update_id >= 0) {
+			ref.floor_update = sc.max_update_id;
+			offset           = sc.max_update_id + 1;
+		}
+		rtc_ep.reply = sc.reply;
+	}
+
+	// 2. Long-poll until an answer counts or the window closes. An update that
+	// is not an answer (other chatter in the chat) ends a poll early; the
+	// offset steps past it and the next poll waits on. An HTTP error will not
+	// clear inside the window (409: a webhook or another reader on this
+	// token; 401: the token), so it ends the window; a lost connection is
+	// tried again, twice, while time is left.
+	int polls = 0, retries = 0;
+	while (!failed && rtc_ep.reply == TG_REPLY_NONE) {
+		code = telegram_get_updates(s_tg_ip, offset, 1, REPLY_WAIT_S, deadline, buf,
+		                            REPLY_BUF_BYTES, &len);
+		if (code == TG_GET_ERR_TIME) {
+			break;   // the window is over
+		}
+		if (code != 200) {
+			if (code > 0 || code == TG_GET_ERR_SIZE || ++retries > 2) {
+				failed = true;
+			} else {
+				delay(200);
+			}
+			continue;
+		}
+		polls++;
+		tg_scan_updates(buf, len, &ref, &sc);
+		if (!sc.ok) {
+			failed = true;
+			continue;
+		}
+		if (sc.max_update_id > ref.floor_update) {
+			ref.floor_update = sc.max_update_id;
+			offset           = sc.max_update_id + 1;
+		}
+		rtc_ep.reply = sc.reply;
+	}
+	heap_caps_free(buf);
+	// Only ever the newest update seen (or, after a renumbering, the new
+	// line): nothing at or below it can count in a later window.
+	rtc_tg_floor_update = ref.floor_update;
+
+	log_i("reply window: %s after %lu ms, %d poll(s)%s", reply_name(),
+	      (unsigned long)(millis() - t_open), polls,
+	      failed ? ", ended on an error" : "");
+	return !failed;
+#else
+	(void)sent;
+	return false;
+#endif
+}
+
 // One rising edge on D1 that opened an episode or continued one. Only the first
 // of an episode is photographed (config.h, PHOTOS_PER_EPISODE): the capture
 // comes first and nothing is allowed in front of it, the radio least of all
 // (9.1), detection judges the photo with the radio still off, and the verdict
 // is the gate for the whole episode (rtc_ep.confirmed). A confirmed episode
-// sends the photo now and records afterwards (video_check()); any other sends
+// sends the photo now, holds the reply window on the same association
+// (config.h) and records afterwards (video_check()); any other sends
 // nothing and records nothing. No second photo, no fresh check: a later edge in
 // the same episode is counted and nothing more.
 static void handle_trigger(uint32_t t_ref_ms)
@@ -1666,18 +1874,29 @@ static void handle_trigger(uint32_t t_ref_ms)
 	rtc_ep.confirmed = confirmed;
 
 	if (confirmed) {
-		if (!send_photo(f, reason)) {
+		// The reply window follows a delivered photo on the same association
+		// (config.h, Reply window), so the camera is still off throughout and
+		// the photo is freed before it opens.
+		tg_sent_t  sent = {};
+		tg_sent_t *ask  = reply_window_wanted() ? &sent : nullptr;
+		const bool ok   = send_photo(f, reason, ask);
+		heap_caps_free(f.data);
+		f.data = nullptr;
+		if (!ok) {
 			// The uplink is down, so a clip would be dropped too: no recording
 			// this episode (config.h, Presence video).
 			rtc_ep.video_done = true;
+		} else if (ask) {
+			reply_window(sent);
+			wifi_down();
 		}
 	} else {
 		rtc_suppressed_total++;
 		rtc_suppressed_since_report++;
 		log_i("no person (best %.2f); suppressed, nothing sent or recorded this "
 		      "episode", f.score);
+		heap_caps_free(f.data);
 	}
-	heap_caps_free(f.data);
 
 	if (rtc_wind_streak >= WIND_STREAK_BACKOFF) {
 		backoff_start();
@@ -1854,6 +2073,11 @@ static bool send_clip(const clip_t &c)
 	why += "\nperson this visit: ";
 	why += rtc_ep.person == EP_PERSON_YES ? "yes" :
 	       rtc_ep.person == EP_PERSON_NO  ? "no"  : "not checked";
+	why += "\nvisit #";
+	why += rtc_ep.tag;
+	why += ", reply: ";
+	why += reply_name();
+	why += visit_recorded_whole() ? " (whole visit)" : " (this is the only clip)";
 
 	bool ok = false;
 	if (telegram_configured()) {
@@ -1903,9 +2127,11 @@ static int clips_last_day()
 static void wake_deadline_arm(uint32_t seconds);
 
 // Record the visit as clips back to back, each sent before the next is
-// recorded (config.h, Presence video). Returns when presence has ended, a send
-// failed, the fuse refused, or the camera gave out, with the episode left for
-// sleep_for_state(): either d1_high false and fall_ms set, or video_done.
+// recorded (config.h, Presence video): all of it on a "keep" answer, the first
+// clip only otherwise (Reply window). Returns when presence has ended, a send
+// failed, the fuse refused, the camera gave out, or the one clip a visit
+// without "keep" gets is done, with the episode left for sleep_for_state():
+// either d1_high false and fall_ms set, or video_done.
 //
 // Each clip cycle, record then send, runs under its own fresh deadline
 // (WAKE_CLIP_DEADLINE_S, config.h): a stuck step trips in minutes, while a
@@ -1921,6 +2147,15 @@ static void video_run()
 			// from now.
 			rtc_ep.d1_high = false;
 			rtc_ep.fall_ms = now_ms();
+			return;
+		}
+		if (!visit_recorded_whole() && rtc_ep.clips >= 1) {
+			// No "keep" to the entry photo (config.h, Reply window): the first
+			// clip, already sent, was this visit's only one. Checked after D1,
+			// so a visit that has ended keeps its fall time for the gap.
+			log_i("visit #%s: reply %s, so no clip after the first", rtc_ep.tag,
+			      reply_name());
+			rtc_ep.video_done = true;
 			return;
 		}
 		if (clips_last_day() >= VIDEO_MAX_CLIPS_PER_DAY) {
@@ -2225,6 +2460,14 @@ static_assert(framesize_pixels(CAM_FRAMESIZE) != 0,
 // fb_get() timeouts (record_clip()), and the time cap checked up to one more
 // 4 s timeout late.
 #define CLIP_UNBOUNDED_S  (1 + 2 * 4 + 4)
+// The reply window (config.h): REPLY_WAIT_S, which every request in it is cut to
+// fit, plus 2 s for what runs between those checks (the last step of a TLS
+// handshake, which is CPU-bound, and parsing).
+#if REPLY_WINDOW_BUILT
+#define REPLY_WINDOW_MAX_S (REPLY_WAIT_S + 2)
+#else
+#define REPLY_WINDOW_MAX_S 0
+#endif
 // A failed hostname refresh ahead of the normal path, at most once a wake: a
 // lease that arrives at the deadline, then a DNS lookup that fails.
 #if DHCP_REFRESH_ENABLED
@@ -2247,12 +2490,14 @@ static_assert(RADAR_UNMANNED_DELAY_S >= 10,
 //
 // The entry stretch, from setup() to the first clip, or to the end of a wake
 // that records none: the idle wait, a hostname refresh, the entry photo's
-// capture and detection, and its association and upload.
+// capture and detection, its association and upload, and the reply window
+// that follows it on the same association.
 static_assert(WAKE_DEADLINE_S > PIR_IDLE_MAX_S + DHCP_REFRESH_MAX_S +
                                 ENTRY_UNBOUNDED_S +
                                 PHOTOS_PER_EPISODE *
                                     (WIFI_UP_MAX_S +
-                                     TG_POST_MAX_S(STILL_MAX_BYTES, TELEGRAM_MIN_BPS)),
+                                     TG_POST_MAX_S(STILL_MAX_BYTES, TELEGRAM_MIN_BPS) +
+                                     REPLY_WINDOW_MAX_S),
               "WAKE_DEADLINE_S no longer covers the entry stretch of a wake (config.h)");
 // One clip cycle: the recording, the camera's own delays, a hostname refresh
 // (the first association of a wake is a clip's when a retrigger resumes a
