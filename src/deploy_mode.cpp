@@ -391,6 +391,11 @@ static String status_json()
 	j += ",\"clips_dropped\":"; j += s.clips_dropped_total;
 	j += ",\"clip_s\":";        j += s.clip_s_total;
 	j += ",\"fuse_trips\":";    j += s.clip_fuse_trips_total;
+	j += ",\"r_keep\":";        j += s.replies_keep_total;
+	j += ",\"r_stop\":";        j += s.replies_stop_total;
+	j += ",\"r_none\":";        j += s.replies_none_total;
+	j += ",\"r_err\":";         j += s.reply_errors_total;
+	j += ",\"r_wait\":";        j += REPLY_WAIT_S;
 	j += ",\"v_on\":";          j += VIDEO_ENABLED ? "true" : "false";
 	j += ",\"v_w\":";           j += resolution[VIDEO_FRAMESIZE].width;
 	j += ",\"v_h\":";           j += resolution[VIDEO_FRAMESIZE].height;
@@ -743,6 +748,9 @@ function render(d){
     'back to back');
   row('Clip fuse',d.v_fuse+'/day · '+(d.fuse_trips?'TRIPPED '+d.fuse_trips+'×':
     'never tripped'));
+  row('Replies',!d.r_wait?'window off (whole visits)':d.r_keep+' keep · '+d.r_stop+
+    ' stop · '+d.r_none+' none'+(d.r_err?' ('+d.r_err+' window errors)':'')+
+    ' · '+d.r_wait+' s window');
   row('Gate',(d.persons_only?'entry photo must hold a person':'off, everything')+
     ' · '+d.per_ep+' photo per visit');
   row('Presence timing','quiet window '+d.quiet+' s · visit gap '+d.gap+' s');

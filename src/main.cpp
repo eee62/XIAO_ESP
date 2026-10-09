@@ -198,6 +198,20 @@ RTC_DATA_ATTR static uint32_t rtc_clip_fuse_trips_total = 0;
 // past, so that nothing at or below it can count as an answer; -1 before the
 // first window since power-on.
 RTC_DATA_ATTR static int64_t  rtc_tg_floor_update = -1;
+// What the windows came to, for the report (9.3): an answer of keep or stop,
+// or none (the window closed, or could not run). Errors are the nones that
+// were the node's fault or the link's rather than silence: a window that could
+// not open after a delivered photo, or ended on a failed request. The usual
+// none is nobody answering, and a node whose errors match its nones is not
+// reading the chat at all (a webhook on the bot, say).
+RTC_DATA_ATTR static uint32_t rtc_replies_keep_total = 0;
+RTC_DATA_ATTR static uint32_t rtc_replies_keep_since_report = 0;
+RTC_DATA_ATTR static uint32_t rtc_replies_stop_total = 0;
+RTC_DATA_ATTR static uint32_t rtc_replies_stop_since_report = 0;
+RTC_DATA_ATTR static uint32_t rtc_replies_none_total = 0;
+RTC_DATA_ATTR static uint32_t rtc_replies_none_since_report = 0;
+RTC_DATA_ATTR static uint32_t rtc_reply_errors_total = 0;
+RTC_DATA_ATTR static uint32_t rtc_reply_errors_since_report = 0;
 
 // Cached association parameters (9.4) — skips the scan on every wake.
 RTC_DATA_ATTR static bool     rtc_have_ap = false;
@@ -815,6 +829,10 @@ void deploy_fill_status(deploy_status_t *out)
 	out->clips_dropped_total        = rtc_clips_dropped_total;
 	out->clip_s_total               = (rtc_clip_ms_total + 500) / 1000;
 	out->clip_fuse_trips_total      = rtc_clip_fuse_trips_total;
+	out->replies_keep_total         = rtc_replies_keep_total;
+	out->replies_stop_total         = rtc_replies_stop_total;
+	out->replies_none_total         = rtc_replies_none_total;
+	out->reply_errors_total         = rtc_reply_errors_total;
 	out->last_report_s              = rtc_last_report_s;
 	out->have_ap_cache              = rtc_have_ap;
 	out->using_dhcp                 = rtc_use_dhcp;
@@ -1306,6 +1324,23 @@ static String telemetry_text(const char *reason, float score, int idx, int total
 		c += rtc_clip_fuse_trips_total;
 		c += "x";
 	}
+	c += "\nreplies keep ";
+	c += rtc_replies_keep_total;
+	c += " (+";
+	c += rtc_replies_keep_since_report;
+	c += "), stop ";
+	c += rtc_replies_stop_total;
+	c += " (+";
+	c += rtc_replies_stop_since_report;
+	c += "), none ";
+	c += rtc_replies_none_total;
+	c += " (+";
+	c += rtc_replies_none_since_report;
+	c += "; window errors ";
+	c += rtc_reply_errors_total;
+	c += " (+";
+	c += rtc_reply_errors_since_report;
+	c += "))";
 	c += "\nradar ignored (wind) ";
 	c += rtc_backoff_s_total;
 	c += " s (+";
@@ -1356,6 +1391,10 @@ static void report_landed()
 	rtc_clips_sent_since_report     = 0;
 	rtc_clips_dropped_since_report  = 0;
 	rtc_clip_ms_since_report        = 0;
+	rtc_replies_keep_since_report   = 0;
+	rtc_replies_stop_since_report   = 0;
+	rtc_replies_none_since_report   = 0;
+	rtc_reply_errors_since_report   = 0;
 	rtc_last_report_s               = now_s();
 }
 
@@ -1801,6 +1840,26 @@ static bool reply_window(const tg_sent_t &sent)
 #endif
 }
 
+// Count what a window came to (rtc_replies_*). `clean` is reply_window()'s
+// verdict: false makes a none an error as well.
+static void reply_counted(bool clean)
+{
+	if (rtc_ep.reply == TG_REPLY_KEEP) {
+		rtc_replies_keep_total++;
+		rtc_replies_keep_since_report++;
+	} else if (rtc_ep.reply == TG_REPLY_STOP) {
+		rtc_replies_stop_total++;
+		rtc_replies_stop_since_report++;
+	} else {
+		rtc_replies_none_total++;
+		rtc_replies_none_since_report++;
+		if (!clean) {
+			rtc_reply_errors_total++;
+			rtc_reply_errors_since_report++;
+		}
+	}
+}
+
 // One rising edge on D1 that opened an episode or continued one. Only the first
 // of an episode is photographed (config.h, PHOTOS_PER_EPISODE): the capture
 // comes first and nothing is allowed in front of it, the radio least of all
@@ -1887,8 +1946,9 @@ static void handle_trigger(uint32_t t_ref_ms)
 			// this episode (config.h, Presence video).
 			rtc_ep.video_done = true;
 		} else if (ask) {
-			reply_window(sent);
+			const bool clean = reply_window(sent);
 			wifi_down();
+			reply_counted(clean);
 		}
 	} else {
 		rtc_suppressed_total++;

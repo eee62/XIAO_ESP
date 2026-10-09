@@ -45,6 +45,10 @@ struct deploy_status_t {
 	uint32_t clips_dropped_total;         // recorded, not delivered
 	uint32_t clip_s_total;                // seconds of clip recorded
 	uint32_t clip_fuse_trips_total;       // recordings the daily fuse refused
+	uint32_t replies_keep_total;          // reply windows (config.h) answered keep
+	uint32_t replies_stop_total;          //   answered stop
+	uint32_t replies_none_total;          //   with no answer, errors included
+	uint32_t reply_errors_total;          //   that failed rather than went quiet
 	uint32_t last_report_s;
 	bool     have_ap_cache;
 	uint8_t  ap_channel;
